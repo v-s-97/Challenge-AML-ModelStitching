@@ -1,0 +1,10 @@
+torch
+transformers
+datasets
+faiss-cpu
+sentence-transformers
+tqdm
+Pillow
+matplotlib
+scikit-learn
+gdown
