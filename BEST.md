@@ -17,7 +17,7 @@ from challenge.src.eval import evaluate_retrieval, visualize_retrieval
 # ==== Config ====
 MODEL_PATH = "models/maxmatch_adapter_k6_sinkhorn.pth"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-EPOCHS = 10
+EPOCHS = 25
 BATCH_SIZE = 256
 
 LR = 0.0012
@@ -54,7 +54,7 @@ REG_ZERO_EPOCHS = 4      # prime 4 epoche: niente regolarizzatori
 REG_RAMP_EPOCHS = 8      # rampa lineare fino a epoch 12 (se EPOCHS>=12)
 
 
-AGG_BETA = 10
+AGG_BETA = 8
 
 
 def _reg_factor(epoch: int) -> float:
@@ -587,12 +587,12 @@ model = train_model(
     [Train] MaxMatch + Sinkhorn + ISDL + GDL (curriculum su τ) ...
     
 
-    [Train] Epoch 1/10: 100%|██████████| 440/440 [00:11<00:00, 38.80it/s]
+    [Train] Epoch 1/25: 100%|██████████| 440/440 [00:11<00:00, 38.44it/s]
     
 
-    val z_cos=0.2253 | loss_tri=0.3750 
-    | isdl=0.8986 | gdl=0.9363 
-    | last_loss=0.3750 | offdiag(E_T): 0.3988 | log-var(S_T): -9.17|
+    val z_cos=0.2283 | loss_tri=0.3750 
+    | isdl=0.8969 | gdl=0.9323 
+    | last_loss=0.3750 | offdiag(E_T): 0.3878 | log-var(S_T): -9.14|
     
     [reg] epoch=1 factor=0.00 | λ_isdl=0.0000 λ_gdl=0.0000 λ_div=0.0000
     
@@ -600,12 +600,12 @@ model = train_model(
       ☐ Saved epoch_001.pth
     
 
-    [Train] Epoch 2/10: 100%|██████████| 440/440 [00:12<00:00, 36.28it/s]
+    [Train] Epoch 2/25: 100%|██████████| 440/440 [00:12<00:00, 35.66it/s]
     
 
-    val z_cos=0.2385 | loss_tri=0.3625 
-    | isdl=0.9008 | gdl=0.9253 
-    | last_loss=0.3625 | offdiag(E_T): 0.3333 | log-var(S_T): -8.98|
+    val z_cos=0.2388 | loss_tri=0.3601 
+    | isdl=0.9101 | gdl=0.9320 
+    | last_loss=0.3601 | offdiag(E_T): 0.3411 | log-var(S_T): -8.99|
     
     [reg] epoch=2 factor=0.00 | λ_isdl=0.0000 λ_gdl=0.0000 λ_div=0.0000
     
@@ -613,12 +613,12 @@ model = train_model(
       ☐ Saved epoch_002.pth
     
 
-    [Train] Epoch 3/10: 100%|██████████| 440/440 [00:11<00:00, 38.07it/s]
+    [Train] Epoch 3/25: 100%|██████████| 440/440 [00:13<00:00, 33.60it/s]
     
 
-    val z_cos=0.2525 | loss_tri=0.3455 
-    | isdl=0.8954 | gdl=0.9109 
-    | last_loss=0.3455 | offdiag(E_T): 0.3410 | log-var(S_T): -8.97|
+    val z_cos=0.2490 | loss_tri=0.3479 
+    | isdl=0.9175 | gdl=0.9329 
+    | last_loss=0.3479 | offdiag(E_T): 0.3796 | log-var(S_T): -9.04|
     
     [reg] epoch=3 factor=0.00 | λ_isdl=0.0000 λ_gdl=0.0000 λ_div=0.0000
     
@@ -626,13 +626,13 @@ model = train_model(
       ☐ Saved epoch_003.pth
     
 
-    [Train] Epoch 4/10: 100%|██████████| 440/440 [00:09<00:00, 45.01it/s]
+    [Train] Epoch 4/25: 100%|██████████| 440/440 [00:12<00:00, 34.53it/s]
     
 
-    [Val-quick] margin=0.0035 | s_pos=0.2176 | s_neg*=0.2141
-    val z_cos=0.2477 | loss_tri=0.3455 
-    | isdl=0.8851 | gdl=0.8935 
-    | last_loss=0.3455 | offdiag(E_T): 0.3272|
+    [Val-quick] margin=0.0027 | s_pos=0.2254 | s_neg*=0.2227
+    val z_cos=0.2504 | loss_tri=0.3430 
+    | isdl=0.9116 | gdl=0.9188 
+    | last_loss=0.3430 | offdiag(E_T): 0.3931|
     
     [reg] epoch=4 factor=0.00 | λ_isdl=0.0000 λ_gdl=0.0000 λ_div=0.0000
     
@@ -640,12 +640,12 @@ model = train_model(
       ☐ Saved epoch_004.pth
     
 
-    [Train] Epoch 5/10: 100%|██████████| 440/440 [03:03<00:00,  2.40it/s]
+    [Train] Epoch 5/25: 100%|██████████| 440/440 [03:35<00:00,  2.04it/s]
     
 
-    val z_cos=0.2189 | loss_tri=0.3396 
-    | isdl=0.8413 | gdl=0.8037 
-    | last_loss=0.3458 | offdiag(E_T): 0.2256|
+    val z_cos=0.2193 | loss_tri=0.3428 
+    | isdl=0.8497 | gdl=0.8111 
+    | last_loss=0.3491 | offdiag(E_T): 0.2610|
     
     [reg] epoch=5 factor=0.12 | λ_isdl=0.0037 λ_gdl=0.0037 λ_div=0.0004
     
@@ -653,12 +653,12 @@ model = train_model(
       ☐ Saved epoch_005.pth
     
 
-    [Train] Epoch 6/10: 100%|██████████| 440/440 [00:10<00:00, 41.62it/s]
+    [Train] Epoch 6/25: 100%|██████████| 440/440 [00:11<00:00, 38.64it/s]
     
 
-    val z_cos=0.2338 | loss_tri=0.3479 
-    | isdl=0.8127 | gdl=0.7745 
-    | last_loss=0.3599 | offdiag(E_T): 0.1519|
+    val z_cos=0.2295 | loss_tri=0.3503 
+    | isdl=0.8137 | gdl=0.7765 
+    | last_loss=0.3624 | offdiag(E_T): 0.1614|
     
     [reg] epoch=6 factor=0.25 | λ_isdl=0.0075 λ_gdl=0.0075 λ_div=0.0009
     
@@ -666,12 +666,12 @@ model = train_model(
       ☐ Saved epoch_006.pth
     
 
-    [Train] Epoch 7/10: 100%|██████████| 440/440 [00:10<00:00, 42.79it/s]
+    [Train] Epoch 7/25: 100%|██████████| 440/440 [00:10<00:00, 40.20it/s]
     
 
-    val z_cos=0.2376 | loss_tri=0.3257 
-    | isdl=0.7931 | gdl=0.7653 
-    | last_loss=0.3434 | offdiag(E_T): 0.0927|
+    val z_cos=0.2380 | loss_tri=0.3250 
+    | isdl=0.7924 | gdl=0.7699 
+    | last_loss=0.3427 | offdiag(E_T): 0.0900|
     
     [reg] epoch=7 factor=0.38 | λ_isdl=0.0112 λ_gdl=0.0112 λ_div=0.0013
     
@@ -679,12 +679,12 @@ model = train_model(
       ☐ Saved epoch_007.pth
     
 
-    [Train] Epoch 8/10: 100%|██████████| 440/440 [00:10<00:00, 41.06it/s]
+    [Train] Epoch 8/25: 100%|██████████| 440/440 [00:10<00:00, 40.49it/s]
     
 
-    val z_cos=0.2334 | loss_tri=0.3257 
-    | isdl=0.7813 | gdl=0.7481 
-    | last_loss=0.3489 | offdiag(E_T): 0.0597|
+    val z_cos=0.2325 | loss_tri=0.3276 
+    | isdl=0.7769 | gdl=0.7511 
+    | last_loss=0.3508 | offdiag(E_T): 0.0522|
     
     [reg] epoch=8 factor=0.50 | λ_isdl=0.0150 λ_gdl=0.0150 λ_div=0.0018
     
@@ -692,12 +692,12 @@ model = train_model(
       ☐ Saved epoch_008.pth
     
 
-    [Train] Epoch 9/10: 100%|██████████| 440/440 [00:10<00:00, 40.96it/s]
+    [Train] Epoch 9/25: 100%|██████████| 440/440 [00:10<00:00, 40.13it/s]
     
 
-    val z_cos=0.2411 | loss_tri=0.3115 
-    | isdl=0.7687 | gdl=0.7491 
-    | last_loss=0.3403 | offdiag(E_T): 0.0462|
+    val z_cos=0.2385 | loss_tri=0.3169 
+    | isdl=0.7643 | gdl=0.7509 
+    | last_loss=0.3456 | offdiag(E_T): 0.0400|
     
     [reg] epoch=9 factor=0.62 | λ_isdl=0.0187 λ_gdl=0.0187 λ_div=0.0022
     
@@ -705,17 +705,212 @@ model = train_model(
       ☐ Saved epoch_009.pth
     
 
-    [Train] Epoch 10/10: 100%|██████████| 440/440 [03:09<00:00,  2.32it/s]
+    [Train] Epoch 10/25: 100%|██████████| 440/440 [03:34<00:00,  2.05it/s]
     
 
-    val z_cos=0.2202 | loss_tri=0.3022 
-    | isdl=0.7749 | gdl=0.7331 
-    | last_loss=0.3366 | offdiag(E_T): 0.0455|
+    val z_cos=0.2190 | loss_tri=0.3037 
+    | isdl=0.7705 | gdl=0.7366 
+    | last_loss=0.3380 | offdiag(E_T): 0.0399|
     
     [reg] epoch=10 factor=0.75 | λ_isdl=0.0225 λ_gdl=0.0225 λ_div=0.0026
     
     
       ☐ Saved epoch_010.pth
+    
+
+    [Train] Epoch 11/25: 100%|██████████| 440/440 [00:10<00:00, 41.04it/s]
+    
+
+    val z_cos=0.2287 | loss_tri=0.2993 
+    | isdl=0.7642 | gdl=0.7342 
+    | last_loss=0.3391 | offdiag(E_T): 0.0424|
+    
+    [reg] epoch=11 factor=0.88 | λ_isdl=0.0262 λ_gdl=0.0262 λ_div=0.0031
+    
+    
+      ☐ Saved epoch_011.pth
+    
+
+    [Train] Epoch 12/25: 100%|██████████| 440/440 [00:11<00:00, 39.10it/s]
+    
+
+    val z_cos=0.2378 | loss_tri=0.3220 
+    | isdl=0.7595 | gdl=0.7297 
+    | last_loss=0.3672 | offdiag(E_T): 0.0439|
+    
+    [reg] epoch=12 factor=1.00 | λ_isdl=0.0300 λ_gdl=0.0300 λ_div=0.0035
+    
+    
+      ☐ Saved epoch_012.pth
+    
+
+    [Train] Epoch 13/25: 100%|██████████| 440/440 [00:11<00:00, 39.92it/s]
+    
+
+    val z_cos=0.2383 | loss_tri=0.2932 
+    | isdl=0.7585 | gdl=0.7281 
+    | last_loss=0.3383 | offdiag(E_T): 0.0470|
+    
+    [reg] epoch=13 factor=1.00 | λ_isdl=0.0300 λ_gdl=0.0300 λ_div=0.0035
+    
+    
+      ☐ Saved epoch_013.pth
+    
+
+    [Train] Epoch 14/25: 100%|██████████| 440/440 [00:10<00:00, 40.91it/s]
+    
+
+    val z_cos=0.2322 | loss_tri=0.3049 
+    | isdl=0.7512 | gdl=0.7285 
+    | last_loss=0.3498 | offdiag(E_T): 0.0505|
+    
+    [reg] epoch=14 factor=1.00 | λ_isdl=0.0300 λ_gdl=0.0300 λ_div=0.0035
+    
+    
+      ☐ Saved epoch_014.pth
+    
+
+    [Train] Epoch 15/25: 100%|██████████| 440/440 [03:33<00:00,  2.06it/s]
+    
+
+    val z_cos=0.2182 | loss_tri=0.3330 
+    | isdl=0.7595 | gdl=0.7211 
+    | last_loss=0.3779 | offdiag(E_T): 0.0494|
+    
+    [reg] epoch=15 factor=1.00 | λ_isdl=0.0300 λ_gdl=0.0300 λ_div=0.0035
+    
+    
+      ☐ Saved epoch_015.pth
+    
+
+    [Train] Epoch 16/25: 100%|██████████| 440/440 [00:10<00:00, 40.16it/s]
+    
+
+    val z_cos=0.2252 | loss_tri=0.3242 
+    | isdl=0.7608 | gdl=0.7205 
+    | last_loss=0.3692 | offdiag(E_T): 0.0482|
+    
+    [reg] epoch=16 factor=1.00 | λ_isdl=0.0300 λ_gdl=0.0300 λ_div=0.0035
+    
+    
+      ☐ Saved epoch_016.pth
+    
+
+    [Train] Epoch 17/25: 100%|██████████| 440/440 [00:11<00:00, 38.98it/s]
+    
+
+    val z_cos=0.2291 | loss_tri=0.3064 
+    | isdl=0.7613 | gdl=0.7240 
+    | last_loss=0.3515 | offdiag(E_T): 0.0503|
+    
+    [reg] epoch=17 factor=1.00 | λ_isdl=0.0300 λ_gdl=0.0300 λ_div=0.0035
+    
+    
+      ☐ Saved epoch_017.pth
+    
+
+    [Train] Epoch 18/25: 100%|██████████| 440/440 [00:11<00:00, 39.64it/s]
+    
+
+    val z_cos=0.2337 | loss_tri=0.2837 
+    | isdl=0.7546 | gdl=0.7220 
+    | last_loss=0.3285 | offdiag(E_T): 0.0528|
+    
+    [reg] epoch=18 factor=1.00 | λ_isdl=0.0300 λ_gdl=0.0300 λ_div=0.0035
+    
+    
+      ☐ Saved epoch_018.pth
+    
+
+    [Train] Epoch 19/25: 100%|██████████| 440/440 [00:11<00:00, 39.22it/s]
+    
+
+    val z_cos=0.2377 | loss_tri=0.2844 
+    | isdl=0.7564 | gdl=0.7222 
+    | last_loss=0.3293 | offdiag(E_T): 0.0549|
+    
+    [reg] epoch=19 factor=1.00 | λ_isdl=0.0300 λ_gdl=0.0300 λ_div=0.0035
+    
+    
+      ☐ Saved epoch_019.pth
+    
+
+    [Train] Epoch 20/25: 100%|██████████| 440/440 [03:31<00:00,  2.08it/s]
+    
+
+    val z_cos=0.2105 | loss_tri=0.3206 
+    | isdl=0.7617 | gdl=0.7158 
+    | last_loss=0.3654 | offdiag(E_T): 0.0537|
+    
+    [reg] epoch=20 factor=1.00 | λ_isdl=0.0300 λ_gdl=0.0300 λ_div=0.0035
+    
+    
+      ☐ Saved epoch_020.pth
+    
+
+    [Train] Epoch 21/25: 100%|██████████| 440/440 [00:10<00:00, 40.24it/s]
+    
+
+    val z_cos=0.2291 | loss_tri=0.3403 
+    | isdl=0.7603 | gdl=0.7206 
+    | last_loss=0.3853 | offdiag(E_T): 0.0529|
+    
+    [reg] epoch=21 factor=1.00 | λ_isdl=0.0300 λ_gdl=0.0300 λ_div=0.0035
+    
+    
+      ☐ Saved epoch_021.pth
+    
+
+    [Train] Epoch 22/25: 100%|██████████| 440/440 [00:11<00:00, 39.69it/s]
+    
+
+    val z_cos=0.2342 | loss_tri=0.2791 
+    | isdl=0.7615 | gdl=0.7166 
+    | last_loss=0.3239 | offdiag(E_T): 0.0547|
+    
+    [reg] epoch=22 factor=1.00 | λ_isdl=0.0300 λ_gdl=0.0300 λ_div=0.0035
+    
+    
+      ☐ Saved epoch_022.pth
+    
+
+    [Train] Epoch 23/25: 100%|██████████| 440/440 [00:11<00:00, 38.48it/s]
+    
+
+    val z_cos=0.2408 | loss_tri=0.2915 
+    | isdl=0.7572 | gdl=0.7178 
+    | last_loss=0.3363 | offdiag(E_T): 0.0563|
+    
+    [reg] epoch=23 factor=1.00 | λ_isdl=0.0300 λ_gdl=0.0300 λ_div=0.0035
+    
+    
+      ☐ Saved epoch_023.pth
+    
+
+    [Train] Epoch 24/25: 100%|██████████| 440/440 [00:11<00:00, 38.83it/s]
+    
+
+    val z_cos=0.2311 | loss_tri=0.3030 
+    | isdl=0.7569 | gdl=0.7163 
+    | last_loss=0.3477 | offdiag(E_T): 0.0574|
+    
+    [reg] epoch=24 factor=1.00 | λ_isdl=0.0300 λ_gdl=0.0300 λ_div=0.0035
+    
+    
+      ☐ Saved epoch_024.pth
+    
+
+    [Train] Epoch 25/25: 100%|██████████| 440/440 [03:31<00:00,  2.08it/s]
+    
+
+    val z_cos=0.2090 | loss_tri=0.3201 
+    | isdl=0.7636 | gdl=0.7138 
+    | last_loss=0.3649 | offdiag(E_T): 0.0566|
+    
+    [reg] epoch=25 factor=1.00 | λ_isdl=0.0300 λ_gdl=0.0300 λ_div=0.0035
+    
+    
+      ☐ Saved epoch_025.pth
     
 
 
@@ -729,7 +924,8 @@ import numpy as np
 from pathlib import Path
 from torch.utils.data import DataLoader, TensorDataset
 from challenge.src.eval.metrics import mrr, ndcg, recall_at_k  # intoccabili
-
+import os
+torch.manual_seed(int.from_bytes(os.urandom(4), "little"))
 model.eval()
 
 # ============================================================
@@ -895,51 +1091,66 @@ print(f"\n[Ready] BEST_CHECKPOINT_FOR_SUBMIT = {BEST_CHECKPOINT_FOR_SUBMIT}")
 ```
 
     [Eval] Val captions: 12,580 | Val images: 2,516
-    epoch_001.pth   → MRR=0.44676
-    epoch_002.pth   → MRR=0.47097
-    epoch_003.pth   → MRR=0.48204
-    epoch_004.pth   → MRR=0.47601
-    epoch_005.pth   → MRR=0.48740
-    epoch_006.pth   → MRR=0.48363
-    epoch_007.pth   → MRR=0.48385
-    epoch_008.pth   → MRR=0.47393
-    epoch_009.pth   → MRR=0.47349
-    epoch_010.pth   → MRR=0.48772
+    epoch_001.pth   → MRR=0.44711
+    epoch_002.pth   → MRR=0.46909
+    epoch_003.pth   → MRR=0.48070
+    epoch_004.pth   → MRR=0.47524
+    epoch_005.pth   → MRR=0.49044
+    epoch_006.pth   → MRR=0.48467
+    epoch_007.pth   → MRR=0.48249
+    epoch_008.pth   → MRR=0.47685
+    epoch_009.pth   → MRR=0.47502
+    epoch_010.pth   → MRR=0.48692
+    epoch_011.pth   → MRR=0.48223
+    epoch_012.pth   → MRR=0.47590
+    epoch_013.pth   → MRR=0.47062
+    epoch_014.pth   → MRR=0.46418
+    epoch_015.pth   → MRR=0.49130
+    epoch_016.pth   → MRR=0.47684
+    epoch_017.pth   → MRR=0.47153
+    epoch_018.pth   → MRR=0.46503
+    epoch_019.pth   → MRR=0.45935
+    epoch_020.pth   → MRR=0.48704
+    epoch_021.pth   → MRR=0.47493
+    epoch_022.pth   → MRR=0.46777
+    epoch_023.pth   → MRR=0.46341
+    epoch_024.pth   → MRR=0.45705
+    epoch_025.pth   → MRR=0.47968
     
     === Miglior checkpoint (MRR su val-gallery) ===
-    epoch_010.pth → MRR=0.48772
+    epoch_015.pth → MRR=0.49130
     
     === Val (image-level split, global gallery) — BEST CKPT ===
-    mrr            : 0.4877
-    ndcg           : 0.5893
-    recall_at_1    : 0.3502
-    recall_at_3    : 0.5595
-    recall_at_5    : 0.6551
-    recall_at_10   : 0.7672
-    recall_at_50   : 0.9226
+    mrr            : 0.4913
+    ndcg           : 0.5922
+    recall_at_1    : 0.3533
+    recall_at_3    : 0.5645
+    recall_at_5    : 0.6638
+    recall_at_10   : 0.7700
+    recall_at_50   : 0.9228
     l2_dist        : 1.2475
     
 
 
     
-![png](BEST%20SCORE%20CON%20VALUTAZIONE%20GIUSTA%20TEST_files/BEST%20SCORE%20CON%20VALUTAZIONE%20GIUSTA%20TEST_1_1.png)
+![png](BEST_files/BEST_1_1.png)
     
 
 
 
     
-![png](BEST%20SCORE%20CON%20VALUTAZIONE%20GIUSTA%20TEST_files/BEST%20SCORE%20CON%20VALUTAZIONE%20GIUSTA%20TEST_1_2.png)
+![png](BEST_files/BEST_1_2.png)
     
 
 
 
     
-![png](BEST%20SCORE%20CON%20VALUTAZIONE%20GIUSTA%20TEST_files/BEST%20SCORE%20CON%20VALUTAZIONE%20GIUSTA%20TEST_1_3.png)
+![png](BEST_files/BEST_1_3.png)
     
 
 
     
-    [Ready] BEST_CHECKPOINT_FOR_SUBMIT = epoch_010.pth
+    [Ready] BEST_CHECKPOINT_FOR_SUBMIT = epoch_015.pth
     
 
 
@@ -1009,10 +1220,10 @@ print("Submission saved to: submission.csv")
 
 ```
 
-    [Submit] Carico checkpoint: models\checkpoints\epoch_010.pth
+    [Submit] Carico checkpoint: models\checkpoints\epoch_015.pth
     Generating submission file...
     ✓ Saved submission to submission.csv
-    [Submit] Usato checkpoint: epoch_010.pth
+    [Submit] Usato checkpoint: epoch_015.pth
     Submission saved to: submission.csv
     
 
@@ -1144,25 +1355,25 @@ if 'results' in globals() and isinstance(results, list) and len(results)>0:
 ```
 
     
-    [Report] Uso checkpoint: epoch_010.pth
+    [Report] Uso checkpoint: epoch_015.pth
     
     [Val] Galleria immagini: 2516  | Query (caption val): 12580
     
     === Aggregatori: classifica per MRR (validation) ===
     Agg                MRR     R@1     R@5    R@10    NDCG
-    softmax_b8      0.4885  0.3512  0.6553  0.7676  0.5900
-    softmax_b10     0.4877  0.3502  0.6551  0.7672  0.5893
-    softmax_b6      0.4877  0.3498  0.6549  0.7669  0.5894
-    softmax_b12     0.4865  0.3482  0.6547  0.7666  0.5883
-    mean            0.4830  0.3448  0.6520  0.7649  0.5855
-    topk3_mean      0.4694  0.3322  0.6362  0.7449  0.5728
-    topk2_mean      0.4466  0.3095  0.6090  0.7223  0.5524
+    softmax_b8      0.4908  0.3525  0.6642  0.7700  0.5920
+    softmax_b10     0.4908  0.3525  0.6642  0.7700  0.5920
+    softmax_b6      0.4907  0.3528  0.6653  0.7692  0.5919
+    softmax_b12     0.4902  0.3526  0.6614  0.7685  0.5912
+    mean            0.4871  0.3488  0.6605  0.7641  0.5886
+    topk3_mean      0.4672  0.3303  0.6336  0.7430  0.5703
+    topk2_mean      0.4418  0.3060  0.6033  0.7144  0.5466
     
-    ⇒ Miglior aggregatore (@epoch_010.pth): softmax_b8  |  MRR=0.48847
+    ⇒ Miglior aggregatore (@epoch_015.pth): softmax_b8  |  MRR=0.49078
     
-    [Geometry] offdiag(E_T)≈0.0511 | log-var(S_T)≈-8.17
+    [Geometry] offdiag(E_T)≈0.0533 | log-var(S_T)≈-8.10
     
-    [Storico] Best per-epoch (MRR sui checkpoint): epoch_010.pth → 0.48772
+    [Storico] Best per-epoch (MRR sui checkpoint): epoch_015.pth → 0.49130
     
 
 
