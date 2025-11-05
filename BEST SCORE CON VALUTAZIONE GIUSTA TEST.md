@@ -17,31 +17,53 @@ from challenge.src.eval import evaluate_retrieval, visualize_retrieval
 # ==== Config ====
 MODEL_PATH = "models/maxmatch_adapter_k6_sinkhorn.pth"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-EPOCHS = 120
+EPOCHS = 10
 BATCH_SIZE = 256
-
-
 
 LR = 0.0012
 WEIGHT_DECAY = 5e-5
 
 K_SLOTS = 6
-SLOT_DROPOUT_P = 0.15
+SLOT_DROPOUT_P = 0.10
 
-SINKHORN_ITERS = 11
+SINKHORN_ITERS = 30            # più iterazioni → P più vicino a bistocastica 'dura'
 SINKHORN_TAU_START = 0.208
-SINKHORN_TAU_END   = 0.190
+SINKHORN_TAU_END   = 0.06     # fine più freddo → meno frazionarietà
 DETACH_ASSIGNMENT = True
 
 SCALE_S = 0.47
-DELTA_1 = 0.38
+DELTA_1 = 0.45
 DELTA_2 = 0.61
 DELTA_3 = 0.564
 
-LAMBDA_ISDL = 0.110
-LAMBDA_GDL  = 0.085
-LAMBDA_MMD  = 0.015
-LAMBDA_DIV  = 0.019
+# LAMBDA_ISDL = 0.110
+# LAMBDA_GDL  = 0.085
+
+LAMBDA_GDL = 0.10
+LAMBDA_ISDL = 0.09
+LAMBDA_DIV  = 0.010   # mantiene diversità senza dominare
+
+
+# --- target bassi (≈ 1/3 dei precedenti) ---
+LAMBDA_ISDL_TGT = 0.03
+LAMBDA_GDL_TGT  = 0.03
+LAMBDA_DIV_TGT  = 0.0035  # ~0.003–0.004 è sufficiente
+
+# --- schedule: 0 per le prime epoche, poi rampa lineare ---
+REG_ZERO_EPOCHS = 4      # prime 4 epoche: niente regolarizzatori
+REG_RAMP_EPOCHS = 8      # rampa lineare fino a epoch 12 (se EPOCHS>=12)
+
+
+AGG_BETA = 10
+
+
+def _reg_factor(epoch: int) -> float:
+    """Fattore ∈[0,1] per i regolarizzatori in funzione dell'epoca (1-based)."""
+    if epoch <= REG_ZERO_EPOCHS:
+        return 0.0
+    if epoch <= REG_ZERO_EPOCHS + REG_RAMP_EPOCHS:
+        return (epoch - REG_ZERO_EPOCHS) / float(REG_RAMP_EPOCHS)
+    return 1.0
 
 
 
@@ -65,8 +87,10 @@ class SetPredictionHead(nn.Module):
         self.text_to_vis = nn.Sequential(
             nn.Linear(d_text, hidden),
             nn.GELU(),
-            nn.Linear(hidden, d_vis),
+            nn.Linear(hidden, d_vis, bias=False),  # bias spostato separato
         )
+        # Bias affine separato per correzione centroide
+        self.affine_bias = nn.Parameter(torch.zeros(d_vis))
 
         self.slot_queries = nn.Parameter(torch.randn(K, d_vis) * 0.02)
         self.gate_per_slot = nn.Linear(d_text, K)
@@ -78,7 +102,12 @@ class SetPredictionHead(nn.Module):
 
     def forward(self, t: torch.Tensor):
         B = t.size(0)
-        t_vis = self.text_to_vis(t)                 # (B, d_vis)
+        t_vis = self.text_to_vis(t)  # (B, d_vis)
+        # ① Normalizza per evitare drift di scala
+        t_vis = F.normalize(t_vis, dim=-1)
+        # ② Correzione affine (Maiorca et al.)
+        t_vis = t_vis + self.affine_bias
+        # ③ LayerNorm come nel codice originale
         t_vis = self.ln_text(t_vis)
 
         gate  = torch.sigmoid(self.gate_per_slot(t))      # (B, K)
@@ -150,51 +179,39 @@ def s_h_maxmatch_sinkhorn(
     sims = torch.matmul(S_T, S_V.transpose(-1, -2))# (B, K, K)
     P = sinkhorn_assignment(sims, tau=tau, iters=iters, detach_input=detach)
     return (P * sims).sum(dim=(1, 2)) / K
-    
-USE_DEGENERATE_SH = True  # True: rapido e identico nel caso colonne uguali
-
-def s_h_singleton_target(S_T: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
-    # S_T: (B,K,D), V: (B,D)
-    Vn = F.normalize(V, dim=-1)
-    sims = torch.einsum('bkd,bd->bk', S_T, Vn)  # (B,K)
-    return sims.mean(dim=1)                      # (B,)
 
 def s_h(S_T: torch.Tensor, V: torch.Tensor, *, tau, iters, detach) -> torch.Tensor:
-    if USE_DEGENERATE_SH:
-        return s_h_singleton_target(S_T, V)
-    else:
-        return s_h_maxmatch_sinkhorn(S_T, V, tau=tau, iters=iters, detach=detach)
+    return s_h_maxmatch_sinkhorn(S_T, V, tau=tau, iters=iters, detach=detach)
 
 
 
-def triplet_maxmatch_sh(S_T, V, delta1, *, tau, iters, detach):
-    B, K, D = S_T.shape
-    s_pos = s_h_maxmatch_sinkhorn(S_T, V, tau=tau, iters=iters, detach=detach)  # (B,)
-    V_all = F.normalize(V, dim=-1)
+@torch.no_grad()
+def ent_rowsoftmax_diagnostics(S_T, V, tau, sharp=0.25, sim_scale=5.0):
+    Vn = F.normalize(V, dim=-1)
+    sims = torch.matmul(S_T, Vn.transpose(0,1))       # (B,K,B)
+    tau_eff = max(1e-6, tau * sharp)
+    Q = torch.softmax(sims * (sim_scale / tau_eff), dim=2)
+    row_max = Q.max(dim=2).values.mean().item()       # picco medio per riga
+    H_rows  = (-(Q.add(1e-12) * Q.add(1e-12).log()).sum(dim=2)).mean().item()
+    return row_max, H_rows
 
-    max_negs = []
-    CH = 128  # blocco sicuro; puoi alzare/abbassare in base alla GPU
-    for start in range(0, B, CH):
-        end = min(B, start + CH)
-        S_blk = S_T[start:end]                                   # (ch,K,D)
+     
 
-        # confronta ogni S_blk[i] con tutte le immagini del batch (B)
-        S_exp = S_blk.unsqueeze(1).expand(end - start, B, K, D).reshape((end - start) * B, K, D)
-        V_exp = V_all.unsqueeze(0).expand(end - start, B, D).reshape((end - start) * B, D)
 
-        s_blk = s_h(S_exp, V_exp, tau=tau, iters=iters, detach=detach)
+def triplet_vectors_hardest(Z: torch.Tensor, Y: torch.Tensor, margin: float) -> torch.Tensor:
+    """
+    Z: (B,D) pred text→vis (L2)
+    Y: (B,D) gt image embeddings (L2)
+    margin: DELTA_1
+    """
+    S = Z @ Y.t()                               # (B,B) cosine sim
+    pos = S.diag()                              # (B,)
+    B = Z.size(0)
+    S = S.clone()
+    S[torch.arange(B), torch.arange(B)] = float('-inf')
+    neg = S.max(dim=1).values                   # hardest neg per riga
+    return F.relu(margin + neg - pos).mean()
 
-        s_blk = s_blk.view(end - start, B)                       # (ch, B)
-
-        # maschera SOLO il positivo per riga: colonna (start + r)
-        rows = torch.arange(end - start, device=S_T.device)
-        cols = torch.arange(start, end, device=S_T.device)
-        s_blk[rows, cols] = float('-inf')
-
-        max_negs.append(s_blk.max(dim=1).values)                 # (ch,)
-
-    s_neg = torch.cat(max_negs, dim=0)                           # (B,)
-    return F.relu(delta1 + s_neg - s_pos).mean()
 
 # ============================================================
 # 3) ISDL – Intra-Set Diversity Loss (Alomari 2025)
@@ -299,27 +316,78 @@ model = SetPredictionHead(
     slot_dropout_p=SLOT_DROPOUT_P
 ).to(DEVICE)
 
+# ---- Aggregatore unico train/test: softmax_b10 ----
+def aggregate_slots_softmax(S_T: torch.Tensor, t_vis_n: torch.Tensor, beta: float = 10.0) -> torch.Tensor:
+    """
+    S_T: (B,K,D) slots già L2-normalizzati
+    t_vis_n: (B,D) globale testo L2-normalizzato
+    Ritorna: Z (B,D) L2-normalizzato
+    """
+    # conf_k = cos(S_k, t_vis)
+    conf = torch.einsum('bkd,bd->bk', S_T, t_vis_n).clamp(-1, 1)   # (B,K)
+    w = torch.softmax(beta * conf, dim=1).unsqueeze(-1)            # (B,K,1)
+    Z = (w * S_T).sum(dim=1)                                       # (B,D)
+    return F.normalize(Z, dim=-1)
+
+
+
+
 print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
 print("\n[Train] MaxMatch + Sinkhorn + ISDL + GDL (curriculum su τ) ...")
 
 # ============================================================
 # 4) GDL – Global Discriminative Loss (Alomari 2025)
-#     Rafforza separazione vs negativi di batch (ranking)
+#  
 # ============================================================
-def gdl_global_discriminative_true(S_T, t_vis_norm, s: float, delta2: float):
+def gdl_global_discriminative_true(E_Tn, t_vis_norm, s: float, delta2: float):
     """
-    GDL: penalizza allineamento slot ↔ globale (stessa modalità/spazio),
-    spingendo gli slot a non collassare sul globale.
+    GDL sui residui normalizzati (pre-fusione), per evitare che gli slot collassino sul globale.
     """
-    # sim per-slot col globale: (B,K)
-    sims = torch.einsum('bkd,bd->bk', S_T, t_vis_norm).clamp(-1,1)
+    sims = torch.einsum('bkd,bd->bk', E_Tn, t_vis_norm).clamp(-1,1)
     return torch.exp(s * (sims - delta2)).mean()
 
 
 
 # ============================================================
-# 5) Diagnostica: log-varianza intra-slot
+# 5) Diagnostica
 # ============================================================
+
+
+
+@torch.no_grad()
+def quick_margin_on_val_batch(model, val_dataset, device, tau, iters, detach=True, batch=512):
+    loader = DataLoader(val_dataset, batch_size=min(batch, len(val_dataset)), shuffle=True)
+    Xb, Yb = next(iter(loader))
+    Xb, Yb = Xb.to(device), Yb.to(device)
+
+    # forward
+    S_T, _, _ = model(Xb)                          # (B,K,D)
+    B, K, D = S_T.shape
+    V_all = F.normalize(Yb, dim=-1)                # (B,D)
+
+    # s_pos
+    s_pos = s_h(S_T, Yb, tau=tau, iters=iters, detach=detach)  # (B,)
+
+    # s_neg (hardest in-batch)
+    CH = 256
+    max_negs = []
+    for start in range(0, B, CH):
+        end = min(B, start + CH)
+        S_blk = S_T[start:end]                                     # (ch,K,D)
+        S_exp = S_blk.unsqueeze(1).expand(end-start, B, K, D).reshape((end-start)*B, K, D)
+        V_exp = V_all.unsqueeze(0).expand(end-start, B, D).reshape((end-start)*B, D)
+        s_blk = s_h(S_exp, V_exp, tau=tau, iters=iters, detach=detach).view(end-start, B)
+        rows = torch.arange(end-start, device=device)
+        cols = torch.arange(start, end,   device=device)
+        s_blk[rows, cols] = float('-inf')                           # maschera il positivo
+        max_negs.append(s_blk.max(dim=1).values)
+    s_neg = torch.cat(max_negs, dim=0)                              # (B,)
+
+    margin = (s_pos - s_neg).mean().item()
+    return margin, s_pos.mean().item(), s_neg.mean().item()
+
+
+
 @torch.no_grad()
 def slot_log_variance(S_T: torch.Tensor) -> float:
     var_fd = S_T.var(dim=1, unbiased=False)   # (B, D)
@@ -335,18 +403,7 @@ def mean_offdiag_cos(E_Tn):
     denom = max(K*(K-1), 1)
     return float(off.abs().sum(dim=(1,2)).mean().item() / denom)
 
-def gaussian_kernel(x, y, sigma=1.0):
-    x2 = (x*x).sum(dim=1, keepdim=True)
-    y2 = (y*y).sum(dim=1, keepdim=True)
-    xy = x @ y.t()
-    dist = x2 - 2*xy + y2.t()
-    return torch.exp(-dist / (2*sigma**2))
 
-def mmd_rbf(x, y, sigma=1.0):
-    Kxx = gaussian_kernel(x, x, sigma).mean()
-    Kyy = gaussian_kernel(y, y, sigma).mean()
-    Kxy = gaussian_kernel(x, y, sigma).mean()
-    return Kxx + Kyy - 2*Kxy
 
 def diversity_regularizer_exp(E: torch.Tensor, s: float = 1.0):
     """
@@ -375,7 +432,6 @@ def subsample_rows(X: torch.Tensor, max_n: int):
     return X.index_select(0, idx)
 
 # Subsample per evitare O(n^2) pieno
-AGG_MAX = 256      # righe per MMD
 RES_MAX = 512      # righe per DIV (BK ~ B*K)
 def train_model(model: nn.Module,
                 train_loader: DataLoader,
@@ -385,10 +441,12 @@ def train_model(model: nn.Module,
                 lr: float,
                 logvar_warm_epochs: int = 3) -> nn.Module:
 
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
-    sched = CosineAnnealingWarmRestarts(opt, T_0=10, T_mult=2, eta_min=1e-5)
+    opt = torch.optim.AdamW(model.parameters(), lr=1.2e-3, weight_decay=1e-4)
+    sched = torch.optim.lr_scheduler.OneCycleLR(
+        opt, max_lr=1.8e-3, total_steps=len(train_loader)*EPOCHS,
+        pct_start=0.15, anneal_strategy="cos", div_factor=10.0, final_div_factor=100.0
+    )
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
-    best_val = -1e9
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -396,6 +454,7 @@ def train_model(model: nn.Module,
         frac = (epoch - 1) / max(epochs - 1, 1)
         SINKHORN_TAU = SINKHORN_TAU_START + frac * (SINKHORN_TAU_END - SINKHORN_TAU_START)
         SINKHORN_TAU = max(SINKHORN_TAU_END, SINKHORN_TAU)  # floor = *_END
+
         for Xb, Yb in tqdm(train_loader, desc=f"[Train] Epoch {epoch}/{epochs}"):
 
 
@@ -414,18 +473,12 @@ def train_model(model: nn.Module,
                     logvar_vals.append(slot_log_variance(S_T))
                 offdiag_vals.append(mean_offdiag_cos(E_Tn))
 
-                # --- s_H (positivo) per logging: forma chiusa (rapida) ---
-                # s_pos = s_h(
-                #     S_T, Yb,
-                #     tau=SINKHORN_TAU, iters=SINKHORN_ITERS, detach=DETACH_ASSIGNMENT
-                # )  # (B,)
+                # --- vettore finale Z con lo stesso aggregatore della submission ---
+                Zb = aggregate_slots_softmax(S_T, t_vis_n, beta=AGG_BETA)   # (B,D)
 
-                # --- loss principali ---
-                # 1) Triplet su S_H (hardest-neg su batch) – usa s_h "wrapper" all'interno
-                loss_tri = triplet_maxmatch_sh(
-                    S_T, Yb, DELTA_1,
-                    tau=SINKHORN_TAU, iters=SINKHORN_ITERS, detach=DETACH_ASSIGNMENT
-                )
+                # --- loss principale: triplet su Z ---
+                Yb_n = F.normalize(Yb, dim=-1)
+                loss_tri = triplet_vectors_hardest(Zb, Yb_n, margin=DELTA_1)
 
                 # 2) ISDL (intra-set, exp con margine)
                 loss_isdl = isdl_intra_set_diversity_exp(E_Tn, s=SCALE_S, delta3=DELTA_3
@@ -433,23 +486,21 @@ def train_model(model: nn.Module,
 
                 # 3) GDL (slot vs globale t_vis nello stesso spazio)
                 loss_gdl = gdl_global_discriminative_true(
-                                        S_T, t_vis_n, s=SCALE_S, delta2=DELTA_2
+                    E_Tn, t_vis_n, s=SCALE_S, delta2=DELTA_2
                 )
-
-                # 4) Opzionali: MMD (media slot ↔ target) e Diversità residui con subsample
-                agg_mean = F.normalize(S_T.mean(dim=1), dim=-1)  # (B,D)
-                agg_mean_ss = subsample_rows(agg_mean, AGG_MAX)
-                Yb_ss       = subsample_rows(F.normalize(Yb, dim=-1).detach(), AGG_MAX)
-                loss_mmd = mmd_rbf(agg_mean_ss, Yb_ss, sigma=1.0)
 
                 E_flat_ss = subsample_rows(E_Tn.reshape(-1, E_Tn.size(-1)), RES_MAX)
                 loss_div  = diversity_regularizer_exp(E_flat_ss, s=1.0)
+                
+                reg_f = _reg_factor(epoch)
+                lam_isdl = LAMBDA_ISDL_TGT * reg_f
+                lam_gdl  = LAMBDA_GDL_TGT  * reg_f
+                lam_div  = LAMBDA_DIV_TGT  * reg_f
 
                 loss = (loss_tri
-                        + LAMBDA_ISDL * loss_isdl
-                        + LAMBDA_GDL  * loss_gdl
-                        + LAMBDA_MMD * loss_mmd
-                        + LAMBDA_DIV * loss_div)
+                        + lam_isdl * loss_isdl
+                        + lam_gdl  * loss_gdl
+                        + lam_div  * loss_div)
 
             # --- backward + step (AMP) ---
             scaler.scale(loss).backward()
@@ -457,55 +508,60 @@ def train_model(model: nn.Module,
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(opt)
             scaler.update()
+            # --- Orthonormal projection (Maiorca et al., 2024) ---
+            if epoch % 5 == 0:
+                with torch.no_grad():
+                    W = model.text_to_vis[-1].weight  # ultimo Linear nel mapping
+                    # Proiezione SVD → ortogonale
+                    U, _, Vt = torch.linalg.svd(W, full_matrices=False)
+                    model.text_to_vis[-1].weight.copy_(U @ Vt)
+        sched.step()
 
-            # --- logging train ---
 
 
-        # ===== Validation: S_H medio come surrogato, versione rapida =====
+
+        
+
+        #Versione rapidissima (1 batch di val)    
+        if epoch == 4:
+            margin, spos_m, sneg_m = quick_margin_on_val_batch(
+                model, val_dataset, DEVICE,
+                tau=SINKHORN_TAU, iters=SINKHORN_ITERS, detach=True, batch=512
+            )
+            print(f"[Val-quick] margin={margin:.4f} | s_pos={spos_m:.4f} | s_neg*={sneg_m:.4f}")
+
+
+        # ===== Validation: proxy coerente con la submission (cos(Z, Y)) =====
         model.eval()
-        val_s_h_sum, val_batches = 0.0, 0
+        val_cos_sum, val_batches = 0.0, 0
         with torch.no_grad():
             for Xb, Yb in DataLoader(val_loader.dataset, batch_size=BATCH_SIZE, shuffle=False):
                 Xb = Xb.to(device, non_blocking=True)
                 Yb = Yb.to(device, non_blocking=True)
-                S_T, _, _ = model(Xb)
-                s_h_val = s_h(
-                    S_T, Yb,
-                    tau=SINKHORN_TAU, iters=SINKHORN_ITERS, detach=DETACH_ASSIGNMENT
-                )
-                val_s_h_sum += float(s_h_val.mean().item())
+                S_T, _, t_vis_n = model(Xb)
+                Zb = aggregate_slots_softmax(S_T, t_vis_n, beta=AGG_BETA)
+                Yb_n = F.normalize(Yb, dim=-1)
+                cos_b = torch.einsum('bd,bd->b', Zb, Yb_n).mean()   # media del coseno batch
+                val_cos_sum += float(cos_b.item())
                 val_batches += 1
 
-        val_s_h_avg = val_s_h_sum / max(val_batches, 1)
+        val_score = val_cos_sum / max(val_batches, 1)
 
         logvar_text = ""
         if len(logvar_vals) > 0:
             logvar_epoch = sum(logvar_vals) / len(logvar_vals)
             logvar_text = f" | log-var(S_T): {logvar_epoch:.2f}"
 
-        print(
-            f"val s_score={val_s_h_avg:.4f} | loss_tri={float(loss_tri.item()):.4f} "
-            f"| isdl={float(loss_isdl.item()):.4f} "
-            f"| gdl={float(loss_gdl.item()):.4f} "
-            
-            f"| last_loss={float(loss.item()):.4f} |"
-            f"offdiag(E_T): {sum(offdiag_vals)/len(offdiag_vals):.4f}{logvar_text}|"
-        )
-
+        print(f"val z_cos={val_score:.4f} | loss_tri={float(loss_tri.item()):.4f} \n"
+            f"| isdl={float(loss_isdl.item()):.4f} | gdl={float(loss_gdl.item()):.4f} \n"
+            f"| last_loss={float(loss.item()):.4f} | offdiag(E_T): {sum(offdiag_vals)/len(offdiag_vals):.4f}{logvar_text}|\n")
+        print(f"[reg] epoch={epoch} factor={reg_f:.2f} | λ_isdl={lam_isdl:.4f} λ_gdl={lam_gdl:.4f} λ_div={lam_div:.4f}\n\n")
         # --- salva anche checkpoint per epoca ---
         ckpt_dir = Path(MODEL_PATH).parent / "checkpoints"
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         ckpt_path = ckpt_dir / f"epoch_{epoch:03d}.pth"
         torch.save(model.state_dict(), ckpt_path)
-
-        # --- best model ---
-        if val_s_h_avg > best_val:
-            best_val = val_s_h_avg
-            torch.save(model.state_dict(), MODEL_PATH)
-            print(f"  ✓ Saved best (val S_H={val_s_h_avg:.4f}) → {ckpt_path.name}")
-        else:
-            print(f"  ☐ Saved {ckpt_path.name}")
-        sched.step(epoch)
+        print(f"  ☐ Saved {ckpt_path.name}")
     return model
 
 
@@ -531,848 +587,135 @@ model = train_model(
     [Train] MaxMatch + Sinkhorn + ISDL + GDL (curriculum su τ) ...
     
 
-    C:\Users\lucam\AppData\Local\Temp\ipykernel_27316\3786990716.py:389: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
-      scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
-    [Train] Epoch 1/120:   0%|          | 0/440 [00:00<?, ?it/s]C:\Users\lucam\AppData\Local\Temp\ipykernel_27316\3786990716.py:406: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
-      with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-    [Train] Epoch 1/120: 100%|██████████| 440/440 [00:39<00:00, 11.15it/s]
+    [Train] Epoch 1/10: 100%|██████████| 440/440 [00:11<00:00, 38.80it/s]
     
 
-    val s_score=0.3006 | loss_tri=0.3188 | isdl=0.7235 | gdl=1.0495 | last_loss=0.4927 |offdiag(E_T): 0.1043 | log-var(S_T): -8.13|
-      ✓ Saved best (val S_H=0.3006) → epoch_001.pth
+    val z_cos=0.2253 | loss_tri=0.3750 
+    | isdl=0.8986 | gdl=0.9363 
+    | last_loss=0.3750 | offdiag(E_T): 0.3988 | log-var(S_T): -9.17|
+    
+    [reg] epoch=1 factor=0.00 | λ_isdl=0.0000 λ_gdl=0.0000 λ_div=0.0000
+    
+    
+      ☐ Saved epoch_001.pth
     
 
-    [Train] Epoch 2/120: 100%|██████████| 440/440 [00:38<00:00, 11.50it/s]
+    [Train] Epoch 2/10: 100%|██████████| 440/440 [00:12<00:00, 36.28it/s]
     
 
-    val s_score=0.2950 | loss_tri=0.3176 | isdl=0.7192 | gdl=1.0524 | last_loss=0.4915 |offdiag(E_T): 0.1341 | log-var(S_T): -8.11|
+    val z_cos=0.2385 | loss_tri=0.3625 
+    | isdl=0.9008 | gdl=0.9253 
+    | last_loss=0.3625 | offdiag(E_T): 0.3333 | log-var(S_T): -8.98|
+    
+    [reg] epoch=2 factor=0.00 | λ_isdl=0.0000 λ_gdl=0.0000 λ_div=0.0000
+    
+    
       ☐ Saved epoch_002.pth
     
 
-    [Train] Epoch 3/120: 100%|██████████| 440/440 [00:37<00:00, 11.61it/s]
+    [Train] Epoch 3/10: 100%|██████████| 440/440 [00:11<00:00, 38.07it/s]
     
 
-    val s_score=0.2802 | loss_tri=0.3149 | isdl=0.7165 | gdl=1.0542 | last_loss=0.4889 |offdiag(E_T): 0.1406 | log-var(S_T): -8.12|
+    val z_cos=0.2525 | loss_tri=0.3455 
+    | isdl=0.8954 | gdl=0.9109 
+    | last_loss=0.3455 | offdiag(E_T): 0.3410 | log-var(S_T): -8.97|
+    
+    [reg] epoch=3 factor=0.00 | λ_isdl=0.0000 λ_gdl=0.0000 λ_div=0.0000
+    
+    
       ☐ Saved epoch_003.pth
     
 
-    [Train] Epoch 4/120: 100%|██████████| 440/440 [00:38<00:00, 11.54it/s]
+    [Train] Epoch 4/10: 100%|██████████| 440/440 [00:09<00:00, 45.01it/s]
     
 
-    val s_score=0.2697 | loss_tri=0.2832 | isdl=0.7188 | gdl=1.0587 | last_loss=0.4578 |offdiag(E_T): 0.1389|
+    [Val-quick] margin=0.0035 | s_pos=0.2176 | s_neg*=0.2141
+    val z_cos=0.2477 | loss_tri=0.3455 
+    | isdl=0.8851 | gdl=0.8935 
+    | last_loss=0.3455 | offdiag(E_T): 0.3272|
+    
+    [reg] epoch=4 factor=0.00 | λ_isdl=0.0000 λ_gdl=0.0000 λ_div=0.0000
+    
+    
       ☐ Saved epoch_004.pth
     
 
-    [Train] Epoch 5/120: 100%|██████████| 440/440 [00:38<00:00, 11.53it/s]
+    [Train] Epoch 5/10: 100%|██████████| 440/440 [03:03<00:00,  2.40it/s]
     
 
-    val s_score=0.2682 | loss_tri=0.2778 | isdl=0.7228 | gdl=1.0656 | last_loss=0.4536 |offdiag(E_T): 0.1301|
+    val z_cos=0.2189 | loss_tri=0.3396 
+    | isdl=0.8413 | gdl=0.8037 
+    | last_loss=0.3458 | offdiag(E_T): 0.2256|
+    
+    [reg] epoch=5 factor=0.12 | λ_isdl=0.0037 λ_gdl=0.0037 λ_div=0.0004
+    
+    
       ☐ Saved epoch_005.pth
     
 
-    [Train] Epoch 6/120: 100%|██████████| 440/440 [00:38<00:00, 11.57it/s]
+    [Train] Epoch 6/10: 100%|██████████| 440/440 [00:10<00:00, 41.62it/s]
     
 
-    val s_score=0.2588 | loss_tri=0.2815 | isdl=0.7246 | gdl=1.0677 | last_loss=0.4578 |offdiag(E_T): 0.1214|
+    val z_cos=0.2338 | loss_tri=0.3479 
+    | isdl=0.8127 | gdl=0.7745 
+    | last_loss=0.3599 | offdiag(E_T): 0.1519|
+    
+    [reg] epoch=6 factor=0.25 | λ_isdl=0.0075 λ_gdl=0.0075 λ_div=0.0009
+    
+    
       ☐ Saved epoch_006.pth
     
 
-    [Train] Epoch 7/120: 100%|██████████| 440/440 [00:38<00:00, 11.50it/s]
+    [Train] Epoch 7/10: 100%|██████████| 440/440 [00:10<00:00, 42.79it/s]
     
 
-    val s_score=0.2559 | loss_tri=0.2415 | isdl=0.7297 | gdl=1.0755 | last_loss=0.4194 |offdiag(E_T): 0.1140|
+    val z_cos=0.2376 | loss_tri=0.3257 
+    | isdl=0.7931 | gdl=0.7653 
+    | last_loss=0.3434 | offdiag(E_T): 0.0927|
+    
+    [reg] epoch=7 factor=0.38 | λ_isdl=0.0112 λ_gdl=0.0112 λ_div=0.0013
+    
+    
       ☐ Saved epoch_007.pth
     
 
-    [Train] Epoch 8/120: 100%|██████████| 440/440 [00:37<00:00, 11.63it/s]
+    [Train] Epoch 8/10: 100%|██████████| 440/440 [00:10<00:00, 41.06it/s]
     
 
-    val s_score=0.2507 | loss_tri=0.2924 | isdl=0.7260 | gdl=1.0705 | last_loss=0.4690 |offdiag(E_T): 0.1088|
+    val z_cos=0.2334 | loss_tri=0.3257 
+    | isdl=0.7813 | gdl=0.7481 
+    | last_loss=0.3489 | offdiag(E_T): 0.0597|
+    
+    [reg] epoch=8 factor=0.50 | λ_isdl=0.0150 λ_gdl=0.0150 λ_div=0.0018
+    
+    
       ☐ Saved epoch_008.pth
     
 
-    [Train] Epoch 9/120: 100%|██████████| 440/440 [00:38<00:00, 11.56it/s]
+    [Train] Epoch 9/10: 100%|██████████| 440/440 [00:10<00:00, 40.96it/s]
     
 
-    val s_score=0.2505 | loss_tri=0.2635 | isdl=0.7346 | gdl=1.0807 | last_loss=0.4426 |offdiag(E_T): 0.1047|
+    val z_cos=0.2411 | loss_tri=0.3115 
+    | isdl=0.7687 | gdl=0.7491 
+    | last_loss=0.3403 | offdiag(E_T): 0.0462|
+    
+    [reg] epoch=9 factor=0.62 | λ_isdl=0.0187 λ_gdl=0.0187 λ_div=0.0022
+    
+    
       ☐ Saved epoch_009.pth
     
 
-    [Train] Epoch 10/120: 100%|██████████| 440/440 [00:38<00:00, 11.55it/s]
+    [Train] Epoch 10/10: 100%|██████████| 440/440 [03:09<00:00,  2.32it/s]
     
 
-    val s_score=0.2482 | loss_tri=0.2495 | isdl=0.7307 | gdl=1.0786 | last_loss=0.4276 |offdiag(E_T): 0.1026|
+    val z_cos=0.2202 | loss_tri=0.3022 
+    | isdl=0.7749 | gdl=0.7331 
+    | last_loss=0.3366 | offdiag(E_T): 0.0455|
+    
+    [reg] epoch=10 factor=0.75 | λ_isdl=0.0225 λ_gdl=0.0225 λ_div=0.0026
+    
+    
       ☐ Saved epoch_010.pth
-    
-
-    [Train] Epoch 11/120: 100%|██████████| 440/440 [00:38<00:00, 11.58it/s]
-    
-
-    val s_score=0.2565 | loss_tri=0.2900 | isdl=0.7239 | gdl=1.0663 | last_loss=0.4659 |offdiag(E_T): 0.1106|
-      ☐ Saved epoch_011.pth
-    
-
-    [Train] Epoch 12/120: 100%|██████████| 440/440 [00:37<00:00, 11.68it/s]
-    
-
-    val s_score=0.2576 | loss_tri=0.2677 | isdl=0.7245 | gdl=1.0685 | last_loss=0.4440 |offdiag(E_T): 0.1140|
-      ☐ Saved epoch_012.pth
-    
-
-    [Train] Epoch 13/120: 100%|██████████| 440/440 [00:37<00:00, 11.65it/s]
-    
-
-    val s_score=0.2540 | loss_tri=0.2652 | isdl=0.7285 | gdl=1.0731 | last_loss=0.4424 |offdiag(E_T): 0.1121|
-      ☐ Saved epoch_013.pth
-    
-
-    [Train] Epoch 14/120: 100%|██████████| 440/440 [00:37<00:00, 11.61it/s]
-    
-
-    val s_score=0.2498 | loss_tri=0.2535 | isdl=0.7328 | gdl=1.0771 | last_loss=0.4317 |offdiag(E_T): 0.1090|
-      ☐ Saved epoch_014.pth
-    
-
-    [Train] Epoch 15/120: 100%|██████████| 440/440 [00:38<00:00, 11.57it/s]
-    
-
-    val s_score=0.2483 | loss_tri=0.2519 | isdl=0.7299 | gdl=1.0747 | last_loss=0.4296 |offdiag(E_T): 0.1053|
-      ☐ Saved epoch_015.pth
-    
-
-    [Train] Epoch 16/120: 100%|██████████| 440/440 [00:37<00:00, 11.64it/s]
-    
-
-    val s_score=0.2462 | loss_tri=0.2685 | isdl=0.7328 | gdl=1.0761 | last_loss=0.4466 |offdiag(E_T): 0.1011|
-      ☐ Saved epoch_016.pth
-    
-
-    [Train] Epoch 17/120: 100%|██████████| 440/440 [00:37<00:00, 11.60it/s]
-    
-
-    val s_score=0.2475 | loss_tri=0.2585 | isdl=0.7279 | gdl=1.0711 | last_loss=0.4353 |offdiag(E_T): 0.0968|
-      ☐ Saved epoch_017.pth
-    
-
-    [Train] Epoch 18/120: 100%|██████████| 440/440 [00:38<00:00, 11.57it/s]
-    
-
-    val s_score=0.2443 | loss_tri=0.2504 | isdl=0.7368 | gdl=1.0805 | last_loss=0.4295 |offdiag(E_T): 0.0923|
-      ☐ Saved epoch_018.pth
-    
-
-    [Train] Epoch 19/120: 100%|██████████| 440/440 [00:37<00:00, 11.58it/s]
-    
-
-    val s_score=0.2398 | loss_tri=0.2572 | isdl=0.7378 | gdl=1.0795 | last_loss=0.4361 |offdiag(E_T): 0.0874|
-      ☐ Saved epoch_019.pth
-    
-
-    [Train] Epoch 20/120: 100%|██████████| 440/440 [00:37<00:00, 11.61it/s]
-    
-
-    val s_score=0.2426 | loss_tri=0.2343 | isdl=0.7412 | gdl=1.0828 | last_loss=0.4140 |offdiag(E_T): 0.0822|
-      ☐ Saved epoch_020.pth
-    
-
-    [Train] Epoch 21/120: 100%|██████████| 440/440 [00:37<00:00, 11.59it/s]
-    
-
-    val s_score=0.2414 | loss_tri=0.2209 | isdl=0.7456 | gdl=1.0856 | last_loss=0.4014 |offdiag(E_T): 0.0772|
-      ☐ Saved epoch_021.pth
-    
-
-    [Train] Epoch 22/120: 100%|██████████| 440/440 [00:38<00:00, 11.57it/s]
-    
-
-    val s_score=0.2386 | loss_tri=0.2290 | isdl=0.7436 | gdl=1.0821 | last_loss=0.4088 |offdiag(E_T): 0.0726|
-      ☐ Saved epoch_022.pth
-    
-
-    [Train] Epoch 23/120: 100%|██████████| 440/440 [00:37<00:00, 11.63it/s]
-    
-
-    val s_score=0.2399 | loss_tri=0.1993 | isdl=0.7548 | gdl=1.0900 | last_loss=0.3812 |offdiag(E_T): 0.0683|
-      ☐ Saved epoch_023.pth
-    
-
-    [Train] Epoch 24/120: 100%|██████████| 440/440 [00:37<00:00, 11.62it/s]
-    
-
-    val s_score=0.2399 | loss_tri=0.2400 | isdl=0.7470 | gdl=1.0858 | last_loss=0.4206 |offdiag(E_T): 0.0651|
-      ☐ Saved epoch_024.pth
-    
-
-    [Train] Epoch 25/120: 100%|██████████| 440/440 [00:37<00:00, 11.61it/s]
-    
-
-    val s_score=0.2357 | loss_tri=0.2127 | isdl=0.7531 | gdl=1.0891 | last_loss=0.3943 |offdiag(E_T): 0.0624|
-      ☐ Saved epoch_025.pth
-    
-
-    [Train] Epoch 26/120: 100%|██████████| 440/440 [00:37<00:00, 11.62it/s]
-    
-
-    val s_score=0.2373 | loss_tri=0.2420 | isdl=0.7502 | gdl=1.0862 | last_loss=0.4229 |offdiag(E_T): 0.0604|
-      ☐ Saved epoch_026.pth
-    
-
-    [Train] Epoch 27/120: 100%|██████████| 440/440 [00:38<00:00, 11.57it/s]
-    
-
-    val s_score=0.2373 | loss_tri=0.2166 | isdl=0.7526 | gdl=1.0897 | last_loss=0.3983 |offdiag(E_T): 0.0591|
-      ☐ Saved epoch_027.pth
-    
-
-    [Train] Epoch 28/120: 100%|██████████| 440/440 [00:38<00:00, 11.58it/s]
-    
-
-    val s_score=0.2373 | loss_tri=0.2379 | isdl=0.7476 | gdl=1.0875 | last_loss=0.4188 |offdiag(E_T): 0.0582|
-      ☐ Saved epoch_028.pth
-    
-
-    [Train] Epoch 29/120: 100%|██████████| 440/440 [00:38<00:00, 11.54it/s]
-    
-
-    val s_score=0.2364 | loss_tri=0.2244 | isdl=0.7535 | gdl=1.0890 | last_loss=0.4060 |offdiag(E_T): 0.0576|
-      ☐ Saved epoch_029.pth
-    
-
-    [Train] Epoch 30/120: 100%|██████████| 440/440 [00:38<00:00, 11.54it/s]
-    
-
-    val s_score=0.2353 | loss_tri=0.2231 | isdl=0.7505 | gdl=1.0869 | last_loss=0.4040 |offdiag(E_T): 0.0573|
-      ☐ Saved epoch_030.pth
-    
-
-    [Train] Epoch 31/120: 100%|██████████| 440/440 [00:37<00:00, 11.59it/s]
-    
-
-    val s_score=0.2393 | loss_tri=0.2290 | isdl=0.7437 | gdl=1.0816 | last_loss=0.4088 |offdiag(E_T): 0.0650|
-      ☐ Saved epoch_031.pth
-    
-
-    [Train] Epoch 32/120: 100%|██████████| 440/440 [00:37<00:00, 11.65it/s]
-    
-
-    val s_score=0.2417 | loss_tri=0.2209 | isdl=0.7499 | gdl=1.0845 | last_loss=0.4018 |offdiag(E_T): 0.0704|
-      ☐ Saved epoch_032.pth
-    
-
-    [Train] Epoch 33/120: 100%|██████████| 440/440 [00:37<00:00, 11.60it/s]
-    
-
-    val s_score=0.2431 | loss_tri=0.2198 | isdl=0.7466 | gdl=1.0838 | last_loss=0.4001 |offdiag(E_T): 0.0713|
-      ☐ Saved epoch_033.pth
-    
-
-    [Train] Epoch 34/120: 100%|██████████| 440/440 [00:37<00:00, 11.65it/s]
-    
-
-    val s_score=0.2366 | loss_tri=0.2315 | isdl=0.7460 | gdl=1.0829 | last_loss=0.4117 |offdiag(E_T): 0.0705|
-      ☐ Saved epoch_034.pth
-    
-
-    [Train] Epoch 35/120: 100%|██████████| 440/440 [00:37<00:00, 11.61it/s]
-    
-
-    val s_score=0.2417 | loss_tri=0.2489 | isdl=0.7438 | gdl=1.0816 | last_loss=0.4287 |offdiag(E_T): 0.0693|
-      ☐ Saved epoch_035.pth
-    
-
-    [Train] Epoch 36/120: 100%|██████████| 440/440 [00:37<00:00, 11.58it/s]
-    
-
-    val s_score=0.2380 | loss_tri=0.2509 | isdl=0.7466 | gdl=1.0827 | last_loss=0.4314 |offdiag(E_T): 0.0681|
-      ☐ Saved epoch_036.pth
-    
-
-    [Train] Epoch 37/120: 100%|██████████| 440/440 [00:38<00:00, 11.48it/s]
-    
-
-    val s_score=0.2356 | loss_tri=0.2175 | isdl=0.7493 | gdl=1.0847 | last_loss=0.3981 |offdiag(E_T): 0.0668|
-      ☐ Saved epoch_037.pth
-    
-
-    [Train] Epoch 38/120: 100%|██████████| 440/440 [00:37<00:00, 11.62it/s]
-    
-
-    val s_score=0.2374 | loss_tri=0.2335 | isdl=0.7457 | gdl=1.0832 | last_loss=0.4138 |offdiag(E_T): 0.0654|
-      ☐ Saved epoch_038.pth
-    
-
-    [Train] Epoch 39/120: 100%|██████████| 440/440 [00:37<00:00, 11.65it/s]
-    
-
-    val s_score=0.2344 | loss_tri=0.2510 | isdl=0.7448 | gdl=1.0812 | last_loss=0.4308 |offdiag(E_T): 0.0635|
-      ☐ Saved epoch_039.pth
-    
-
-    [Train] Epoch 40/120: 100%|██████████| 440/440 [00:37<00:00, 11.59it/s]
-    
-
-    val s_score=0.2369 | loss_tri=0.2183 | isdl=0.7530 | gdl=1.0879 | last_loss=0.3999 |offdiag(E_T): 0.0621|
-      ☐ Saved epoch_040.pth
-    
-
-    [Train] Epoch 41/120: 100%|██████████| 440/440 [00:37<00:00, 11.66it/s]
-    
-
-    val s_score=0.2369 | loss_tri=0.2427 | isdl=0.7493 | gdl=1.0839 | last_loss=0.4234 |offdiag(E_T): 0.0607|
-      ☐ Saved epoch_041.pth
-    
-
-    [Train] Epoch 42/120: 100%|██████████| 440/440 [00:37<00:00, 11.61it/s]
-    
-
-    val s_score=0.2375 | loss_tri=0.2185 | isdl=0.7530 | gdl=1.0867 | last_loss=0.3998 |offdiag(E_T): 0.0596|
-      ☐ Saved epoch_042.pth
-    
-
-    [Train] Epoch 43/120: 100%|██████████| 440/440 [00:38<00:00, 11.57it/s]
-    
-
-    val s_score=0.2393 | loss_tri=0.2221 | isdl=0.7520 | gdl=1.0860 | last_loss=0.4032 |offdiag(E_T): 0.0583|
-      ☐ Saved epoch_043.pth
-    
-
-    [Train] Epoch 44/120: 100%|██████████| 440/440 [00:37<00:00, 11.59it/s]
-    
-
-    val s_score=0.2393 | loss_tri=0.2260 | isdl=0.7565 | gdl=1.0888 | last_loss=0.4080 |offdiag(E_T): 0.0575|
-      ☐ Saved epoch_044.pth
-    
-
-    [Train] Epoch 45/120: 100%|██████████| 440/440 [00:38<00:00, 11.57it/s]
-    
-
-    val s_score=0.2370 | loss_tri=0.2161 | isdl=0.7563 | gdl=1.0878 | last_loss=0.3980 |offdiag(E_T): 0.0567|
-      ☐ Saved epoch_045.pth
-    
-
-    [Train] Epoch 46/120: 100%|██████████| 440/440 [00:37<00:00, 11.66it/s]
-    
-
-    val s_score=0.2349 | loss_tri=0.2215 | isdl=0.7588 | gdl=1.0897 | last_loss=0.4038 |offdiag(E_T): 0.0560|
-      ☐ Saved epoch_046.pth
-    
-
-    [Train] Epoch 47/120: 100%|██████████| 440/440 [00:37<00:00, 11.60it/s]
-    
-
-    val s_score=0.2356 | loss_tri=0.2110 | isdl=0.7672 | gdl=1.0928 | last_loss=0.3943 |offdiag(E_T): 0.0559|
-      ☐ Saved epoch_047.pth
-    
-
-    [Train] Epoch 48/120: 100%|██████████| 440/440 [00:37<00:00, 11.63it/s]
-    
-
-    val s_score=0.2321 | loss_tri=0.2072 | isdl=0.7593 | gdl=1.0897 | last_loss=0.3896 |offdiag(E_T): 0.0557|
-      ☐ Saved epoch_048.pth
-    
-
-    [Train] Epoch 49/120: 100%|██████████| 440/440 [00:37<00:00, 11.61it/s]
-    
-
-    val s_score=0.2329 | loss_tri=0.2043 | isdl=0.7596 | gdl=1.0899 | last_loss=0.3867 |offdiag(E_T): 0.0557|
-      ☐ Saved epoch_049.pth
-    
-
-    [Train] Epoch 50/120: 100%|██████████| 440/440 [00:37<00:00, 11.63it/s]
-    
-
-    val s_score=0.2345 | loss_tri=0.2087 | isdl=0.7636 | gdl=1.0917 | last_loss=0.3917 |offdiag(E_T): 0.0561|
-      ☐ Saved epoch_050.pth
-    
-
-    [Train] Epoch 51/120: 100%|██████████| 440/440 [00:37<00:00, 11.63it/s]
-    
-
-    val s_score=0.2340 | loss_tri=0.2028 | isdl=0.7637 | gdl=1.0909 | last_loss=0.3857 |offdiag(E_T): 0.0566|
-      ☐ Saved epoch_051.pth
-    
-
-    [Train] Epoch 52/120: 100%|██████████| 440/440 [00:37<00:00, 11.64it/s]
-    
-
-    val s_score=0.2337 | loss_tri=0.2051 | isdl=0.7729 | gdl=1.0948 | last_loss=0.3896 |offdiag(E_T): 0.0573|
-      ☐ Saved epoch_052.pth
-    
-
-    [Train] Epoch 53/120: 100%|██████████| 440/440 [00:37<00:00, 11.63it/s]
-    
-
-    val s_score=0.2345 | loss_tri=0.1970 | isdl=0.7758 | gdl=1.0967 | last_loss=0.3819 |offdiag(E_T): 0.0583|
-      ☐ Saved epoch_053.pth
-    
-
-    [Train] Epoch 54/120: 100%|██████████| 440/440 [00:37<00:00, 11.60it/s]
-    
-
-    val s_score=0.2293 | loss_tri=0.2102 | isdl=0.7694 | gdl=1.0935 | last_loss=0.3940 |offdiag(E_T): 0.0592|
-      ☐ Saved epoch_054.pth
-    
-
-    [Train] Epoch 55/120: 100%|██████████| 440/440 [00:37<00:00, 11.62it/s]
-    
-
-    val s_score=0.2342 | loss_tri=0.2113 | isdl=0.7714 | gdl=1.0950 | last_loss=0.3955 |offdiag(E_T): 0.0602|
-      ☐ Saved epoch_055.pth
-    
-
-    [Train] Epoch 56/120: 100%|██████████| 440/440 [00:37<00:00, 11.65it/s]
-    
-
-    val s_score=0.2350 | loss_tri=0.1826 | isdl=0.7738 | gdl=1.0956 | last_loss=0.3672 |offdiag(E_T): 0.0615|
-      ☐ Saved epoch_056.pth
-    
-
-    [Train] Epoch 57/120: 100%|██████████| 440/440 [00:37<00:00, 11.59it/s]
-    
-
-    val s_score=0.2338 | loss_tri=0.1950 | isdl=0.7680 | gdl=1.0929 | last_loss=0.3785 |offdiag(E_T): 0.0628|
-      ☐ Saved epoch_057.pth
-    
-
-    [Train] Epoch 58/120: 100%|██████████| 440/440 [00:37<00:00, 11.63it/s]
-    
-
-    val s_score=0.2320 | loss_tri=0.1873 | isdl=0.7759 | gdl=1.0969 | last_loss=0.3721 |offdiag(E_T): 0.0639|
-      ☐ Saved epoch_058.pth
-    
-
-    [Train] Epoch 59/120: 100%|██████████| 440/440 [00:37<00:00, 11.59it/s]
-    
-
-    val s_score=0.2312 | loss_tri=0.1767 | isdl=0.7759 | gdl=1.0979 | last_loss=0.3615 |offdiag(E_T): 0.0651|
-      ☐ Saved epoch_059.pth
-    
-
-    [Train] Epoch 60/120: 100%|██████████| 440/440 [00:37<00:00, 11.58it/s]
-    
-
-    val s_score=0.2317 | loss_tri=0.1979 | isdl=0.7757 | gdl=1.0978 | last_loss=0.3827 |offdiag(E_T): 0.0661|
-      ☐ Saved epoch_060.pth
-    
-
-    [Train] Epoch 61/120: 100%|██████████| 440/440 [00:38<00:00, 11.57it/s]
-    
-
-    val s_score=0.2315 | loss_tri=0.1996 | isdl=0.7775 | gdl=1.0983 | last_loss=0.3848 |offdiag(E_T): 0.0673|
-      ☐ Saved epoch_061.pth
-    
-
-    [Train] Epoch 62/120: 100%|██████████| 440/440 [00:37<00:00, 11.63it/s]
-    
-
-    val s_score=0.2311 | loss_tri=0.1824 | isdl=0.7766 | gdl=1.0958 | last_loss=0.3671 |offdiag(E_T): 0.0686|
-      ☐ Saved epoch_062.pth
-    
-
-    [Train] Epoch 63/120: 100%|██████████| 440/440 [00:37<00:00, 11.59it/s]
-    
-
-    val s_score=0.2315 | loss_tri=0.2024 | isdl=0.7856 | gdl=1.1015 | last_loss=0.3887 |offdiag(E_T): 0.0695|
-      ☐ Saved epoch_063.pth
-    
-
-    [Train] Epoch 64/120: 100%|██████████| 440/440 [00:37<00:00, 11.60it/s]
-    
-
-    val s_score=0.2301 | loss_tri=0.1984 | isdl=0.7778 | gdl=1.0982 | last_loss=0.3835 |offdiag(E_T): 0.0702|
-      ☐ Saved epoch_064.pth
-    
-
-    [Train] Epoch 65/120: 100%|██████████| 440/440 [00:37<00:00, 11.59it/s]
-    
-
-    val s_score=0.2300 | loss_tri=0.1930 | isdl=0.7746 | gdl=1.0965 | last_loss=0.3777 |offdiag(E_T): 0.0711|
-      ☐ Saved epoch_065.pth
-    
-
-    [Train] Epoch 66/120: 100%|██████████| 440/440 [00:37<00:00, 11.65it/s]
-    
-
-    val s_score=0.2293 | loss_tri=0.1857 | isdl=0.7844 | gdl=1.0998 | last_loss=0.3717 |offdiag(E_T): 0.0716|
-      ☐ Saved epoch_066.pth
-    
-
-    [Train] Epoch 67/120: 100%|██████████| 440/440 [00:37<00:00, 11.62it/s]
-    
-
-    val s_score=0.2297 | loss_tri=0.1699 | isdl=0.7861 | gdl=1.1014 | last_loss=0.3562 |offdiag(E_T): 0.0720|
-      ☐ Saved epoch_067.pth
-    
-
-    [Train] Epoch 68/120: 100%|██████████| 440/440 [00:37<00:00, 11.61it/s]
-    
-
-    val s_score=0.2310 | loss_tri=0.2016 | isdl=0.7778 | gdl=1.0987 | last_loss=0.3870 |offdiag(E_T): 0.0723|
-      ☐ Saved epoch_068.pth
-    
-
-    [Train] Epoch 69/120: 100%|██████████| 440/440 [00:37<00:00, 11.63it/s]
-    
-
-    val s_score=0.2306 | loss_tri=0.1912 | isdl=0.7904 | gdl=1.1024 | last_loss=0.3780 |offdiag(E_T): 0.0725|
-      ☐ Saved epoch_069.pth
-    
-
-    [Train] Epoch 70/120: 100%|██████████| 440/440 [00:37<00:00, 11.63it/s]
-    
-
-    val s_score=0.2303 | loss_tri=0.1729 | isdl=0.7837 | gdl=1.1002 | last_loss=0.3589 |offdiag(E_T): 0.0726|
-      ☐ Saved epoch_070.pth
-    
-
-    [Train] Epoch 71/120: 100%|██████████| 440/440 [00:37<00:00, 11.60it/s]
-    
-
-    val s_score=0.2322 | loss_tri=0.2238 | isdl=0.7595 | gdl=1.0868 | last_loss=0.4059 |offdiag(E_T): 0.0669|
-      ☐ Saved epoch_071.pth
-    
-
-    [Train] Epoch 72/120: 100%|██████████| 440/440 [00:38<00:00, 11.55it/s]
-    
-
-    val s_score=0.2342 | loss_tri=0.2132 | isdl=0.7635 | gdl=1.0913 | last_loss=0.3963 |offdiag(E_T): 0.0580|
-      ☐ Saved epoch_072.pth
-    
-
-    [Train] Epoch 73/120: 100%|██████████| 440/440 [00:37<00:00, 11.61it/s]
-    
-
-    val s_score=0.2378 | loss_tri=0.2131 | isdl=0.7686 | gdl=1.0925 | last_loss=0.3967 |offdiag(E_T): 0.0569|
-      ☐ Saved epoch_073.pth
-    
-
-    [Train] Epoch 74/120: 100%|██████████| 440/440 [00:37<00:00, 11.58it/s]
-    
-
-    val s_score=0.2365 | loss_tri=0.2197 | isdl=0.7629 | gdl=1.0917 | last_loss=0.4025 |offdiag(E_T): 0.0567|
-      ☐ Saved epoch_074.pth
-    
-
-    [Train] Epoch 75/120: 100%|██████████| 440/440 [00:37<00:00, 11.62it/s]
-    
-
-    val s_score=0.2339 | loss_tri=0.1994 | isdl=0.7674 | gdl=1.0927 | last_loss=0.3829 |offdiag(E_T): 0.0564|
-      ☐ Saved epoch_075.pth
-    
-
-    [Train] Epoch 76/120: 100%|██████████| 440/440 [00:38<00:00, 11.57it/s]
-    
-
-    val s_score=0.2377 | loss_tri=0.2215 | isdl=0.7636 | gdl=1.0896 | last_loss=0.4041 |offdiag(E_T): 0.0561|
-      ☐ Saved epoch_076.pth
-    
-
-    [Train] Epoch 77/120: 100%|██████████| 440/440 [00:37<00:00, 11.60it/s]
-    
-
-    val s_score=0.2374 | loss_tri=0.2207 | isdl=0.7603 | gdl=1.0882 | last_loss=0.4030 |offdiag(E_T): 0.0561|
-      ☐ Saved epoch_077.pth
-    
-
-    [Train] Epoch 78/120: 100%|██████████| 440/440 [00:38<00:00, 11.57it/s]
-    
-
-    val s_score=0.2400 | loss_tri=0.1918 | isdl=0.7637 | gdl=1.0907 | last_loss=0.3746 |offdiag(E_T): 0.0562|
-      ☐ Saved epoch_078.pth
-    
-
-    [Train] Epoch 79/120: 100%|██████████| 440/440 [00:38<00:00, 11.57it/s]
-    
-
-    val s_score=0.2373 | loss_tri=0.2137 | isdl=0.7677 | gdl=1.0919 | last_loss=0.3971 |offdiag(E_T): 0.0566|
-      ☐ Saved epoch_079.pth
-    
-
-    [Train] Epoch 80/120: 100%|██████████| 440/440 [00:37<00:00, 11.58it/s]
-    
-
-    val s_score=0.2313 | loss_tri=0.2091 | isdl=0.7634 | gdl=1.0916 | last_loss=0.3922 |offdiag(E_T): 0.0566|
-      ☐ Saved epoch_080.pth
-    
-
-    [Train] Epoch 81/120: 100%|██████████| 440/440 [00:38<00:00, 11.56it/s]
-    
-
-    val s_score=0.2386 | loss_tri=0.2051 | isdl=0.7635 | gdl=1.0907 | last_loss=0.3880 |offdiag(E_T): 0.0569|
-      ☐ Saved epoch_081.pth
-    
-
-    [Train] Epoch 82/120: 100%|██████████| 440/440 [00:37<00:00, 11.61it/s]
-    
-
-    val s_score=0.2366 | loss_tri=0.1914 | isdl=0.7696 | gdl=1.0927 | last_loss=0.3751 |offdiag(E_T): 0.0570|
-      ☐ Saved epoch_082.pth
-    
-
-    [Train] Epoch 83/120: 100%|██████████| 440/440 [00:37<00:00, 11.58it/s]
-    
-
-    val s_score=0.2329 | loss_tri=0.2129 | isdl=0.7696 | gdl=1.0914 | last_loss=0.3965 |offdiag(E_T): 0.0575|
-      ☐ Saved epoch_083.pth
-    
-
-    [Train] Epoch 84/120: 100%|██████████| 440/440 [00:38<00:00, 11.56it/s]
-    
-
-    val s_score=0.2313 | loss_tri=0.2125 | isdl=0.7614 | gdl=1.0886 | last_loss=0.3949 |offdiag(E_T): 0.0580|
-      ☐ Saved epoch_084.pth
-    
-
-    [Train] Epoch 85/120: 100%|██████████| 440/440 [00:37<00:00, 11.63it/s]
-    
-
-    val s_score=0.2331 | loss_tri=0.2105 | isdl=0.7604 | gdl=1.0892 | last_loss=0.3933 |offdiag(E_T): 0.0586|
-      ☐ Saved epoch_085.pth
-    
-
-    [Train] Epoch 86/120: 100%|██████████| 440/440 [00:37<00:00, 11.62it/s]
-    
-
-    val s_score=0.2303 | loss_tri=0.2078 | isdl=0.7639 | gdl=1.0917 | last_loss=0.3908 |offdiag(E_T): 0.0588|
-      ☐ Saved epoch_086.pth
-    
-
-    [Train] Epoch 87/120: 100%|██████████| 440/440 [00:37<00:00, 11.60it/s]
-    
-
-    val s_score=0.2323 | loss_tri=0.2293 | isdl=0.7659 | gdl=1.0922 | last_loss=0.4126 |offdiag(E_T): 0.0594|
-      ☐ Saved epoch_087.pth
-    
-
-    [Train] Epoch 88/120: 100%|██████████| 440/440 [00:38<00:00, 11.52it/s]
-    
-
-    val s_score=0.2346 | loss_tri=0.1926 | isdl=0.7755 | gdl=1.0957 | last_loss=0.3773 |offdiag(E_T): 0.0599|
-      ☐ Saved epoch_088.pth
-    
-
-    [Train] Epoch 89/120: 100%|██████████| 440/440 [00:37<00:00, 11.59it/s]
-    
-
-    val s_score=0.2346 | loss_tri=0.2317 | isdl=0.7678 | gdl=1.0921 | last_loss=0.4152 |offdiag(E_T): 0.0610|
-      ☐ Saved epoch_089.pth
-    
-
-    [Train] Epoch 90/120: 100%|██████████| 440/440 [00:37<00:00, 11.61it/s]
-    
-
-    val s_score=0.2336 | loss_tri=0.2035 | isdl=0.7667 | gdl=1.0915 | last_loss=0.3870 |offdiag(E_T): 0.0615|
-      ☐ Saved epoch_090.pth
-    
-
-    [Train] Epoch 91/120: 100%|██████████| 440/440 [00:38<00:00, 11.58it/s]
-    
-
-    val s_score=0.2307 | loss_tri=0.1908 | isdl=0.7690 | gdl=1.0929 | last_loss=0.3746 |offdiag(E_T): 0.0621|
-      ☐ Saved epoch_091.pth
-    
-
-    [Train] Epoch 92/120: 100%|██████████| 440/440 [00:38<00:00, 11.56it/s]
-    
-
-    val s_score=0.2308 | loss_tri=0.1882 | isdl=0.7712 | gdl=1.0945 | last_loss=0.3724 |offdiag(E_T): 0.0628|
-      ☐ Saved epoch_092.pth
-    
-
-    [Train] Epoch 93/120: 100%|██████████| 440/440 [00:37<00:00, 11.62it/s]
-    
-
-    val s_score=0.2294 | loss_tri=0.2074 | isdl=0.7804 | gdl=1.0976 | last_loss=0.3930 |offdiag(E_T): 0.0637|
-      ☐ Saved epoch_093.pth
-    
-
-    [Train] Epoch 94/120: 100%|██████████| 440/440 [00:38<00:00, 11.53it/s]
-    
-
-    val s_score=0.2302 | loss_tri=0.1864 | isdl=0.7747 | gdl=1.0947 | last_loss=0.3709 |offdiag(E_T): 0.0642|
-      ☐ Saved epoch_094.pth
-    
-
-    [Train] Epoch 95/120: 100%|██████████| 440/440 [00:38<00:00, 11.37it/s]
-    
-
-    val s_score=0.2321 | loss_tri=0.2064 | isdl=0.7703 | gdl=1.0937 | last_loss=0.3904 |offdiag(E_T): 0.0652|
-      ☐ Saved epoch_095.pth
-    
-
-    [Train] Epoch 96/120: 100%|██████████| 440/440 [00:38<00:00, 11.55it/s]
-    
-
-    val s_score=0.2332 | loss_tri=0.1856 | isdl=0.7806 | gdl=1.0974 | last_loss=0.3711 |offdiag(E_T): 0.0661|
-      ☐ Saved epoch_096.pth
-    
-
-    [Train] Epoch 97/120: 100%|██████████| 440/440 [00:37<00:00, 11.59it/s]
-    
-
-    val s_score=0.2307 | loss_tri=0.2114 | isdl=0.7711 | gdl=1.0943 | last_loss=0.3955 |offdiag(E_T): 0.0672|
-      ☐ Saved epoch_097.pth
-    
-
-    [Train] Epoch 98/120: 100%|██████████| 440/440 [00:37<00:00, 11.60it/s]
-    
-
-    val s_score=0.2328 | loss_tri=0.1899 | isdl=0.7697 | gdl=1.0930 | last_loss=0.3735 |offdiag(E_T): 0.0681|
-      ☐ Saved epoch_098.pth
-    
-
-    [Train] Epoch 99/120: 100%|██████████| 440/440 [00:37<00:00, 11.61it/s]
-    
-
-    val s_score=0.2357 | loss_tri=0.2091 | isdl=0.7682 | gdl=1.0922 | last_loss=0.3924 |offdiag(E_T): 0.0691|
-      ☐ Saved epoch_099.pth
-    
-
-    [Train] Epoch 100/120: 100%|██████████| 440/440 [00:37<00:00, 11.59it/s]
-    
-
-    val s_score=0.2267 | loss_tri=0.2042 | isdl=0.7796 | gdl=1.0969 | last_loss=0.3896 |offdiag(E_T): 0.0698|
-      ☐ Saved epoch_100.pth
-    
-
-    [Train] Epoch 101/120: 100%|██████████| 440/440 [00:38<00:00, 11.52it/s]
-    
-
-    val s_score=0.2314 | loss_tri=0.1863 | isdl=0.7865 | gdl=1.1003 | last_loss=0.3725 |offdiag(E_T): 0.0711|
-      ☐ Saved epoch_101.pth
-    
-
-    [Train] Epoch 102/120: 100%|██████████| 440/440 [00:38<00:00, 11.57it/s]
-    
-
-    val s_score=0.2271 | loss_tri=0.1963 | isdl=0.7798 | gdl=1.0969 | last_loss=0.3817 |offdiag(E_T): 0.0720|
-      ☐ Saved epoch_102.pth
-    
-
-    [Train] Epoch 103/120: 100%|██████████| 440/440 [00:37<00:00, 11.58it/s]
-    
-
-    val s_score=0.2307 | loss_tri=0.1923 | isdl=0.7796 | gdl=1.0974 | last_loss=0.3778 |offdiag(E_T): 0.0731|
-      ☐ Saved epoch_103.pth
-    
-
-    [Train] Epoch 104/120: 100%|██████████| 440/440 [00:38<00:00, 11.56it/s]
-    
-
-    val s_score=0.2288 | loss_tri=0.1738 | isdl=0.7868 | gdl=1.0995 | last_loss=0.3603 |offdiag(E_T): 0.0744|
-      ☐ Saved epoch_104.pth
-    
-
-    [Train] Epoch 105/120: 100%|██████████| 440/440 [00:37<00:00, 11.58it/s]
-    
-
-    val s_score=0.2268 | loss_tri=0.2013 | isdl=0.7782 | gdl=1.0969 | last_loss=0.3866 |offdiag(E_T): 0.0755|
-      ☐ Saved epoch_105.pth
-    
-
-    [Train] Epoch 106/120: 100%|██████████| 440/440 [00:38<00:00, 11.55it/s]
-    
-
-    val s_score=0.2315 | loss_tri=0.1750 | isdl=0.7896 | gdl=1.1014 | last_loss=0.3617 |offdiag(E_T): 0.0767|
-      ☐ Saved epoch_106.pth
-    
-
-    [Train] Epoch 107/120: 100%|██████████| 440/440 [00:37<00:00, 11.61it/s]
-    
-
-    val s_score=0.2301 | loss_tri=0.1743 | isdl=0.7919 | gdl=1.1021 | last_loss=0.3613 |offdiag(E_T): 0.0779|
-      ☐ Saved epoch_107.pth
-    
-
-    [Train] Epoch 108/120: 100%|██████████| 440/440 [00:37<00:00, 11.58it/s]
-    
-
-    val s_score=0.2273 | loss_tri=0.1764 | isdl=0.7926 | gdl=1.1019 | last_loss=0.3636 |offdiag(E_T): 0.0791|
-      ☐ Saved epoch_108.pth
-    
-
-    [Train] Epoch 109/120: 100%|██████████| 440/440 [00:37<00:00, 11.60it/s]
-    
-
-    val s_score=0.2286 | loss_tri=0.2076 | isdl=0.7812 | gdl=1.0961 | last_loss=0.3928 |offdiag(E_T): 0.0805|
-      ☐ Saved epoch_109.pth
-    
-
-    [Train] Epoch 110/120: 100%|██████████| 440/440 [00:37<00:00, 11.59it/s]
-    
-
-    val s_score=0.2309 | loss_tri=0.1970 | isdl=0.7858 | gdl=1.0985 | last_loss=0.3832 |offdiag(E_T): 0.0814|
-      ☐ Saved epoch_110.pth
-    
-
-    [Train] Epoch 111/120: 100%|██████████| 440/440 [00:37<00:00, 11.59it/s]
-    
-
-    val s_score=0.2297 | loss_tri=0.1651 | isdl=0.7963 | gdl=1.1041 | last_loss=0.3528 |offdiag(E_T): 0.0824|
-      ☐ Saved epoch_111.pth
-    
-
-    [Train] Epoch 112/120: 100%|██████████| 440/440 [00:38<00:00, 11.54it/s]
-    
-
-    val s_score=0.2305 | loss_tri=0.1718 | isdl=0.7923 | gdl=1.1017 | last_loss=0.3589 |offdiag(E_T): 0.0840|
-      ☐ Saved epoch_112.pth
-    
-
-    [Train] Epoch 113/120: 100%|██████████| 440/440 [00:37<00:00, 11.61it/s]
-    
-
-    val s_score=0.2295 | loss_tri=0.1685 | isdl=0.7908 | gdl=1.1010 | last_loss=0.3554 |offdiag(E_T): 0.0851|
-      ☐ Saved epoch_113.pth
-    
-
-    [Train] Epoch 114/120: 100%|██████████| 440/440 [00:37<00:00, 11.63it/s]
-    
-
-    val s_score=0.2302 | loss_tri=0.1642 | isdl=0.7913 | gdl=1.0999 | last_loss=0.3509 |offdiag(E_T): 0.0864|
-      ☐ Saved epoch_114.pth
-    
-
-    [Train] Epoch 115/120: 100%|██████████| 440/440 [00:37<00:00, 11.61it/s]
-    
-
-    val s_score=0.2288 | loss_tri=0.1919 | isdl=0.7892 | gdl=1.1011 | last_loss=0.3786 |offdiag(E_T): 0.0876|
-      ☐ Saved epoch_115.pth
-    
-
-    [Train] Epoch 116/120: 100%|██████████| 440/440 [00:37<00:00, 11.64it/s]
-    
-
-    val s_score=0.2282 | loss_tri=0.1975 | isdl=0.7882 | gdl=1.1008 | last_loss=0.3842 |offdiag(E_T): 0.0889|
-      ☐ Saved epoch_116.pth
-    
-
-    [Train] Epoch 117/120: 100%|██████████| 440/440 [00:37<00:00, 11.63it/s]
-    
-
-    val s_score=0.2284 | loss_tri=0.1886 | isdl=0.7917 | gdl=1.1022 | last_loss=0.3757 |offdiag(E_T): 0.0899|
-      ☐ Saved epoch_117.pth
-    
-
-    [Train] Epoch 118/120: 100%|██████████| 440/440 [00:37<00:00, 11.59it/s]
-    
-
-    val s_score=0.2279 | loss_tri=0.1532 | isdl=0.7910 | gdl=1.1011 | last_loss=0.3401 |offdiag(E_T): 0.0911|
-      ☐ Saved epoch_118.pth
-    
-
-    [Train] Epoch 119/120: 100%|██████████| 440/440 [00:37<00:00, 11.59it/s]
-    
-
-    val s_score=0.2261 | loss_tri=0.1772 | isdl=0.7949 | gdl=1.1035 | last_loss=0.3648 |offdiag(E_T): 0.0924|
-      ☐ Saved epoch_119.pth
-    
-
-    [Train] Epoch 120/120: 100%|██████████| 440/440 [00:37<00:00, 11.64it/s]
-    
-
-    val s_score=0.2271 | loss_tri=0.1843 | isdl=0.7882 | gdl=1.1001 | last_loss=0.3708 |offdiag(E_T): 0.0936|
-      ☐ Saved epoch_120.pth
     
 
 
@@ -1392,19 +735,15 @@ model.eval()
 # ============================================================
 # Aggregazione slot -> 1 embedding (submission-compatibile)
 # ============================================================
+
+
 @torch.no_grad()
-def aggregate_slots(S_T: torch.Tensor, V_ref: torch.Tensor | None = None, mode: str = "mean"):
-    assert S_T.dim() == 3, f"aggregate_slots: atteso (B,K,D), trovato {tuple(S_T.shape)}"
-    if mode == "mean" or V_ref is None:
-        out = S_T.mean(dim=1)
-        return F.normalize(out, dim=-1)
-    # winner-slot
-    assert V_ref is not None and V_ref.dim() == 2 and V_ref.size(0) == S_T.size(0)
-    Vn = F.normalize(V_ref, dim=-1)
-    sims = torch.einsum('bkd,bd->bk', S_T, Vn)
-    idx  = sims.argmax(dim=1)
-    out  = S_T[torch.arange(S_T.size(0), device=S_T.device), idx, :]
-    return F.normalize(out, dim=-1)
+def aggregate_slots(S_T: torch.Tensor, t_vis_n: torch.Tensor) -> torch.Tensor:
+    # stesso aggregatore della fase di training: softmax_b10
+    conf = torch.einsum('bkd,bd->bk', S_T, t_vis_n).clamp(-1, 1)
+    w = torch.softmax(10.0 * conf, dim=1).unsqueeze(-1)
+    Z = (w * S_T).sum(dim=1)
+    return F.normalize(Z, dim=-1)
 
 # ===========================
 # Split COERENTE per IMMAGINI (stesso hashing del train)
@@ -1503,8 +842,8 @@ with torch.no_grad():
         preds_val = []
         for Xb, _ in DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False):
             Xb = Xb.to(DEVICE, non_blocking=True)
-            S_Tb, _, _ = model(Xb)
-            Eb = aggregate_slots(S_Tb, mode="mean")
+            S_Tb, _, t_vis_n = model(Xb)               # (B,K,D), (B,D)
+            Eb = aggregate_slots(S_Tb, t_vis_n)        # (B,D)  <-- coerente
             preds_val.append(Eb.cpu())
         Z_val = F.normalize(torch.cat(preds_val, dim=0), dim=-1).cpu()
 
@@ -1529,8 +868,8 @@ preds_val = []
 with torch.no_grad():
     for Xb, _ in DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False):
         Xb = Xb.to(DEVICE, non_blocking=True)
-        S_Tb, _, _ = model(Xb)
-        Eb = aggregate_slots(S_Tb, mode="mean")
+        S_Tb, _, t_vis_n = model(Xb)               # (B,K,D), (B,D)
+        Eb = aggregate_slots(S_Tb, t_vis_n)        # (B,D)  <-- coerente
         preds_val.append(Eb.cpu())
 Z_val_best = F.normalize(torch.cat(preds_val, dim=0), dim=-1).cpu()
 
@@ -1543,8 +882,8 @@ for k, v in res_val.items():
 for _ in range(3):
     i = np.random.randint(0, len(X_val))
     with torch.no_grad():
-        Sb, _, _ = model(X_val[i:i+1].to(DEVICE))
-        zb = aggregate_slots(Sb, mode="mean").cpu().squeeze(0)
+        Sb, _, tvis = model(X_val[i:i+1].to(DEVICE))
+        zb = aggregate_slots(Sb, tvis).cpu()        # (B,D)  <-- coerente
     caption_text = train_data['captions/text'][CAP_VAL_MASK][i]
     gt_idx = int(val_label[i])
     visualize_retrieval(zb, gt_idx, val_img_file, caption_text, val_img_embd, k=5)
@@ -1556,139 +895,29 @@ print(f"\n[Ready] BEST_CHECKPOINT_FOR_SUBMIT = {BEST_CHECKPOINT_FOR_SUBMIT}")
 ```
 
     [Eval] Val captions: 12,580 | Val images: 2,516
-    epoch_001.pth   → MRR=0.42384
-    epoch_002.pth   → MRR=0.44404
-    epoch_003.pth   → MRR=0.44908
-    epoch_004.pth   → MRR=0.45069
-    epoch_005.pth   → MRR=0.45406
-    epoch_006.pth   → MRR=0.45170
-    epoch_007.pth   → MRR=0.44866
-    epoch_008.pth   → MRR=0.44671
-    epoch_009.pth   → MRR=0.44968
-    epoch_010.pth   → MRR=0.44911
-    epoch_011.pth   → MRR=0.43893
-    epoch_012.pth   → MRR=0.43729
-    epoch_013.pth   → MRR=0.43746
-    epoch_014.pth   → MRR=0.43673
-    epoch_015.pth   → MRR=0.43105
-    epoch_016.pth   → MRR=0.43069
-    epoch_017.pth   → MRR=0.43152
-    epoch_018.pth   → MRR=0.42764
-    epoch_019.pth   → MRR=0.42180
-    epoch_020.pth   → MRR=0.42272
-    epoch_021.pth   → MRR=0.42001
-    epoch_022.pth   → MRR=0.41903
-    epoch_023.pth   → MRR=0.41535
-    epoch_024.pth   → MRR=0.41635
-    epoch_025.pth   → MRR=0.41440
-    epoch_026.pth   → MRR=0.41347
-    epoch_027.pth   → MRR=0.41275
-    epoch_028.pth   → MRR=0.41119
-    epoch_029.pth   → MRR=0.41155
-    epoch_030.pth   → MRR=0.41072
-    epoch_031.pth   → MRR=0.40733
-    epoch_032.pth   → MRR=0.40860
-    epoch_033.pth   → MRR=0.40724
-    epoch_034.pth   → MRR=0.40635
-    epoch_035.pth   → MRR=0.40681
-    epoch_036.pth   → MRR=0.40366
-    epoch_037.pth   → MRR=0.40543
-    epoch_038.pth   → MRR=0.40338
-    epoch_039.pth   → MRR=0.39987
-    epoch_040.pth   → MRR=0.40206
-    epoch_041.pth   → MRR=0.39931
-    epoch_042.pth   → MRR=0.39763
-    epoch_043.pth   → MRR=0.39532
-    epoch_044.pth   → MRR=0.39322
-    epoch_045.pth   → MRR=0.39446
-    epoch_046.pth   → MRR=0.39040
-    epoch_047.pth   → MRR=0.39351
-    epoch_048.pth   → MRR=0.39258
-    epoch_049.pth   → MRR=0.38755
-    epoch_050.pth   → MRR=0.38907
-    epoch_051.pth   → MRR=0.38824
-    epoch_052.pth   → MRR=0.38721
-    epoch_053.pth   → MRR=0.39063
-    epoch_054.pth   → MRR=0.38474
-    epoch_055.pth   → MRR=0.38406
-    epoch_056.pth   → MRR=0.38450
-    epoch_057.pth   → MRR=0.38338
-    epoch_058.pth   → MRR=0.38147
-    epoch_059.pth   → MRR=0.38064
-    epoch_060.pth   → MRR=0.37960
-    epoch_061.pth   → MRR=0.37853
-    epoch_062.pth   → MRR=0.37896
-    epoch_063.pth   → MRR=0.37851
-    epoch_064.pth   → MRR=0.37771
-    epoch_065.pth   → MRR=0.37747
-    epoch_066.pth   → MRR=0.37714
-    epoch_067.pth   → MRR=0.37730
-    epoch_068.pth   → MRR=0.37736
-    epoch_069.pth   → MRR=0.37798
-    epoch_070.pth   → MRR=0.37777
-    epoch_071.pth   → MRR=0.37748
-    epoch_072.pth   → MRR=0.37742
-    epoch_073.pth   → MRR=0.38648
-    epoch_074.pth   → MRR=0.38154
-    epoch_075.pth   → MRR=0.38410
-    epoch_076.pth   → MRR=0.38169
-    epoch_077.pth   → MRR=0.37989
-    epoch_078.pth   → MRR=0.38125
-    epoch_079.pth   → MRR=0.38052
-    epoch_080.pth   → MRR=0.37858
-    epoch_081.pth   → MRR=0.38094
-    epoch_082.pth   → MRR=0.37579
-    epoch_083.pth   → MRR=0.38039
-    epoch_084.pth   → MRR=0.37409
-    epoch_085.pth   → MRR=0.37322
-    epoch_086.pth   → MRR=0.37719
-    epoch_087.pth   → MRR=0.37209
-    epoch_088.pth   → MRR=0.37734
-    epoch_089.pth   → MRR=0.37265
-    epoch_090.pth   → MRR=0.37447
-    epoch_091.pth   → MRR=0.37262
-    epoch_092.pth   → MRR=0.37163
-    epoch_093.pth   → MRR=0.37178
-    epoch_094.pth   → MRR=0.37197
-    epoch_095.pth   → MRR=0.36949
-    epoch_096.pth   → MRR=0.36979
-    epoch_097.pth   → MRR=0.37168
-    epoch_098.pth   → MRR=0.36792
-    epoch_099.pth   → MRR=0.36637
-    epoch_100.pth   → MRR=0.36902
-    epoch_101.pth   → MRR=0.36747
-    epoch_102.pth   → MRR=0.36365
-    epoch_103.pth   → MRR=0.36735
-    epoch_104.pth   → MRR=0.36407
-    epoch_105.pth   → MRR=0.36316
-    epoch_106.pth   → MRR=0.36405
-    epoch_107.pth   → MRR=0.36106
-    epoch_108.pth   → MRR=0.36259
-    epoch_109.pth   → MRR=0.36623
-    epoch_110.pth   → MRR=0.36571
-    epoch_111.pth   → MRR=0.36161
-    epoch_112.pth   → MRR=0.35944
-    epoch_113.pth   → MRR=0.36125
-    epoch_114.pth   → MRR=0.35933
-    epoch_115.pth   → MRR=0.35827
-    epoch_116.pth   → MRR=0.35743
-    epoch_117.pth   → MRR=0.35866
-    epoch_118.pth   → MRR=0.35932
-    epoch_119.pth   → MRR=0.35749
-    epoch_120.pth   → MRR=0.35773
+    epoch_001.pth   → MRR=0.44676
+    epoch_002.pth   → MRR=0.47097
+    epoch_003.pth   → MRR=0.48204
+    epoch_004.pth   → MRR=0.47601
+    epoch_005.pth   → MRR=0.48740
+    epoch_006.pth   → MRR=0.48363
+    epoch_007.pth   → MRR=0.48385
+    epoch_008.pth   → MRR=0.47393
+    epoch_009.pth   → MRR=0.47349
+    epoch_010.pth   → MRR=0.48772
     
     === Miglior checkpoint (MRR su val-gallery) ===
-    epoch_005.pth → MRR=0.45406
+    epoch_010.pth → MRR=0.48772
     
     === Val (image-level split, global gallery) — BEST CKPT ===
-    mrr            : 0.4541
-    ndcg           : 0.5598
-    recall_at_1    : 0.3175
-    recall_at_3    : 0.5214
-    recall_at_5    : 0.6229
-    recall_at_10   : 0.7355
-    recall_at_50   : 0.9060
-    l2_dist        : 1.1306
+    mrr            : 0.4877
+    ndcg           : 0.5893
+    recall_at_1    : 0.3502
+    recall_at_3    : 0.5595
+    recall_at_5    : 0.6551
+    recall_at_10   : 0.7672
+    recall_at_50   : 0.9226
+    l2_dist        : 1.2475
     
 
 
@@ -1710,19 +939,8 @@ print(f"\n[Ready] BEST_CHECKPOINT_FOR_SUBMIT = {BEST_CHECKPOINT_FOR_SUBMIT}")
 
 
     
-    [Ready] BEST_CHECKPOINT_FOR_SUBMIT = epoch_005.pth
+    [Ready] BEST_CHECKPOINT_FOR_SUBMIT = epoch_010.pth
     
-
-
-    === Val (image-level split, global gallery) ===
-    mrr            : 0.8892
-    ndcg           : 0.9116
-    recall_at_1    : 0.8449
-    recall_at_3    : 0.9254
-    recall_at_5    : 0.9437
-    recall_at_10   : 0.9629
-    recall_at_50   : 0.9808
-    l2_dist        : 1.0720
 
 
 ```python
@@ -1761,24 +979,14 @@ test_ids   = test_data['captions/ids']
 test_embds = torch.from_numpy(test_data['captions/embeddings']).float()  # (N, D_txt)
 
 # -- 3) Predizione in batch (coerente con val)
-@torch.no_grad()
-def aggregate_slots(S_T: torch.Tensor, V_ref: torch.Tensor | None = None, mode: str = "mean"):
-    assert S_T.dim() == 3
-    if mode == "mean" or V_ref is None:
-        return F.normalize(S_T.mean(dim=1), dim=-1)
-    Vn = F.normalize(V_ref, dim=-1)
-    sims = torch.einsum('bkd,bd->bk', S_T, Vn)
-    idx  = sims.argmax(dim=1)
-    out  = S_T[torch.arange(S_T.size(0), device=S_T.device), idx, :]
-    return F.normalize(out, dim=-1)
 
 pred_chunks = []
 with torch.inference_mode():
     loader = DataLoader(test_embds, batch_size=BATCH_SIZE, shuffle=False, pin_memory=(DEVICE.type=='cuda'))
     for Xb in loader:
         Xb = Xb.to(DEVICE, non_blocking=True)
-        S_Tb, _, _ = model(Xb)                     # (B, K, D)
-        Eb = aggregate_slots(S_Tb, mode="mean")    # (B, D) L2-normalized
+        S_Tb, _, t_vis_n = model(Xb)                                  # (B,K,D), (B,D)
+        Eb = aggregate_slots_softmax(S_Tb, t_vis_n, beta=AGG_BETA)        # (B,D) L2-normalized
         pred_chunks.append(Eb.cpu().to(torch.float32))
 
 pred_embds_test = torch.cat(pred_chunks, dim=0)   # (N, D) CPU float32
@@ -1801,10 +1009,10 @@ print("Submission saved to: submission.csv")
 
 ```
 
-    [Submit] Carico checkpoint: models\checkpoints\epoch_005.pth
+    [Submit] Carico checkpoint: models\checkpoints\epoch_010.pth
     Generating submission file...
     ✓ Saved submission to submission.csv
-    [Submit] Usato checkpoint: epoch_005.pth
+    [Submit] Usato checkpoint: epoch_010.pth
     Submission saved to: submission.csv
     
 
@@ -1853,10 +1061,12 @@ AGG_SPACE = [
     ("mean",            lambda S,T: agg_mean(S,T)),
     ("softmax_b6",      lambda S,T: agg_softmax_with_tvis(S,T,beta=6.0)),
     ("softmax_b8",      lambda S,T: agg_softmax_with_tvis(S,T,beta=8.0)),
-    ("softmax_b10",     lambda S,T: agg_softmax_with_tvis(S,T,beta=10.0)),
+    ("softmax_b10",     lambda S,T: agg_softmax_with_tvis(S,T,beta=AGG_BETA)),
+    ("softmax_b12",     lambda S,T: agg_softmax_with_tvis(S,T,beta=12.0)),   # << aggiunta
     ("topk2_mean",      lambda S,T: agg_topk_mean(S,T,k=2)),
     ("topk3_mean",      lambda S,T: agg_topk_mean(S,T,k=3)),
 ]
+
 
 # ---- 3) Istanzia un modello *temporaneo* per non alterare il tuo 'model' ----
 tmp_model = SetPredictionHead(
@@ -1909,7 +1119,7 @@ for name, MRRv, R1, R5, R10, NDCGv in rows:
 best_name, best_mrr = rows[0][0], rows[0][1]
 print(f"\n⇒ Miglior aggregatore (@{ckpt_path.name}): {best_name}  |  MRR={best_mrr:.5f}")
 
-# ---- 5) Diagnostica geometrica (offdiag/log-var) sullo stesso checkpoint ----
+# ---- 5) Diagnostica geometrica (offdiag/log-var) sullo stesso checkpoint ----LAMBDA_GDL 
 @torch.no_grad()
 def _diagnostics_batch():
     Xb, _ = next(iter(DataLoader(val_dataset, batch_size=min(256, len(val_dataset)), shuffle=True)))
@@ -1934,24 +1144,25 @@ if 'results' in globals() and isinstance(results, list) and len(results)>0:
 ```
 
     
-    [Report] Uso checkpoint: epoch_005.pth
+    [Report] Uso checkpoint: epoch_010.pth
     
     [Val] Galleria immagini: 2516  | Query (caption val): 12580
     
     === Aggregatori: classifica per MRR (validation) ===
     Agg                MRR     R@1     R@5    R@10    NDCG
-    softmax_b10     0.4547  0.3188  0.6231  0.7358  0.5603
-    softmax_b8      0.4545  0.3183  0.6236  0.7355  0.5601
-    softmax_b6      0.4544  0.3180  0.6232  0.7359  0.5601
-    mean            0.4541  0.3175  0.6229  0.7355  0.5598
-    topk3_mean      0.4508  0.3157  0.6180  0.7288  0.5569
-    topk2_mean      0.4475  0.3110  0.6180  0.7267  0.5538
+    softmax_b8      0.4885  0.3512  0.6553  0.7676  0.5900
+    softmax_b10     0.4877  0.3502  0.6551  0.7672  0.5893
+    softmax_b6      0.4877  0.3498  0.6549  0.7669  0.5894
+    softmax_b12     0.4865  0.3482  0.6547  0.7666  0.5883
+    mean            0.4830  0.3448  0.6520  0.7649  0.5855
+    topk3_mean      0.4694  0.3322  0.6362  0.7449  0.5728
+    topk2_mean      0.4466  0.3095  0.6090  0.7223  0.5524
     
-    ⇒ Miglior aggregatore (@epoch_005.pth): softmax_b10  |  MRR=0.45470
+    ⇒ Miglior aggregatore (@epoch_010.pth): softmax_b8  |  MRR=0.48847
     
-    [Geometry] offdiag(E_T)≈0.1516 | log-var(S_T)≈-8.19
+    [Geometry] offdiag(E_T)≈0.0511 | log-var(S_T)≈-8.17
     
-    [Storico] Best per-epoch (MRR sui checkpoint): epoch_005.pth → 0.45406
+    [Storico] Best per-epoch (MRR sui checkpoint): epoch_010.pth → 0.48772
     
 
 
